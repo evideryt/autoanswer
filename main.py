@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import (
     Application,
     MessageHandler, # Нужен только обработчик сообщений
-    filters,        # Импортируем filters, чтобы использовать UpdateType
+    filters,        # Импортируем filters, чтобы использовать ALL
     ContextTypes,
 )
 from telegram.constants import ChatType
@@ -40,16 +40,20 @@ except ValueError:
 
 logger.info(f"BOT_TOKEN loaded: YES")
 logger.info(f"WEBHOOK_URL loaded: {WEBHOOK_URL}")
-logger.info(f"PORT configured: {PORT}") # Render сам подставит значение $PORT
+logger.info(f"PORT configured: {PORT}")
 logger.info(f"MY_TELEGRAM_ID (forward target) loaded: {MY_TELEGRAM_ID}")
 
 # --- Основной обработчик сообщений ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received update: {update.to_json()}") # Логируем все обновление
+    # Логируем абсолютно все, что пришло в этот обработчик
+    logger.info(f"HANDLE_MESSAGE TRIGGERED! Update: {update.to_json()}")
 
+    # Дальнейшая логика остается прежней, но теперь мы хотя бы увидим, вызывается ли функция
     message = update.message
     if not message:
-        logger.debug("Update does not contain a message.")
+        # Логируем и другие типы апдейтов, если они не сообщение
+        logger.info(f"Update received, but it's not a standard message (e.g., {update.effective_update.__class__.__name__}).")
+        # Можно добавить логику для других типов, если интересно, но пока просто выходим
         return
 
     original_chat = message.chat
@@ -80,33 +84,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_text = f"[Non-text message type: {message.effective_attachment.mime_type if message.effective_attachment else 'Unknown'}]"
         if message.caption: message_text += f"\nCaption: {message.caption}"
 
-    # Экранируем символы Markdown V2 для безопасности
     def escape_markdown_v2(text: str) -> str:
-        # Символы для экранирования в MarkdownV2
         escape_chars = r'_*[]()~`>#+-=|{}.!'
-        # Создаем регулярное выражение для поиска этих символов
-        # Нужно экранировать сам символ '-' в диапазоне или списке
-        # escape_pattern = re.compile(f'([{re.escape(escape_chars)}])') # Старый вариант с re
-        # Простой вариант без re
         escaped_text = ""
-        for char in str(text): # Убедимся, что работаем со строкой
+        for char in str(text):
             if char in escape_chars:
                 escaped_text += f'\\{char}'
             else:
                 escaped_text += char
         return escaped_text
 
-    # Экранируем части текста перед вставкой в Markdown
     safe_sender_info = escape_markdown_v2(sender_info)
     safe_chat_info = escape_markdown_v2(chat_info)
-    safe_message_text = escape_markdown_v2(message_text) # Экранируем и сам текст сообщения
+    safe_message_text = escape_markdown_v2(message_text)
 
     forward_text = (
         f"📩 *New Message*\n\n"
         f"*From:* {safe_sender_info}\n"
         f"*In:* {safe_chat_info}\n"
         f"───────\n"
-        f"{safe_message_text}" # Используем экранированный текст
+        f"{safe_message_text}"
     )
 
     try:
@@ -118,15 +115,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Forwarded message from chat {original_chat.id} to {MY_TELEGRAM_ID}")
     except TelegramError as e:
         logger.error(f"Failed to forward message to {MY_TELEGRAM_ID} (MarkdownV2): {e}")
-        # Попробуем отправить как обычный текст, если Markdown не сработал
         try:
-            # Собираем текст без Markdown символов
              forward_text_plain = (
                 f"📩 New Message\n\n"
-                f"From: {sender_info}\n" # Обычный текст
-                f"In: {chat_info}\n"     # Обычный текст
+                f"From: {sender_info}\n"
+                f"In: {chat_info}\n"
                 f"───────\n"
-                f"{message_text}"      # Обычный текст
+                f"{message_text}"
              )
              await context.bot.send_message(
                 chat_id=MY_TELEGRAM_ID,
@@ -150,7 +145,7 @@ async def post_init(application: Application):
     try:
         await application.bot.set_webhook(
             url=webhook_full_url,
-            allowed_updates=Update.ALL_TYPES, # Оставляем ALL_TYPES для теста
+            allowed_updates=Update.ALL_TYPES, # Оставляем ALL_TYPES
             drop_pending_updates=True
         )
         webhook_info = await application.bot.get_webhook_info()
@@ -174,9 +169,9 @@ if __name__ == "__main__":
         .build()
     )
 
-    # --- Регистрация ОДНОГО обработчика с ИСПРАВЛЕННЫМ фильтром ---
-    # Ловим ВСЕ сообщения (текст, фото, стикеры и т.д.), не являющиеся командами
-    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_message))
+    # --- Регистрация ОДНОГО обработчика с МАКСИМАЛЬНО ШИРОКИМ фильтром ---
+    # Ловим ВСЕ типы обновлений (сообщения, коллбэки, что угодно), не являющиеся командами
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     logger.info("Application built. Starting webhook listener...")
     try:
