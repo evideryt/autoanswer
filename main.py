@@ -1,3 +1,4 @@
+# ... (все импорты и настройки до handle_business_update остаются без изменений) ...
 import logging
 import os
 import asyncio
@@ -5,17 +6,18 @@ import json
 from collections import deque
 import google.generativeai as genai
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup # <--- Добавляем кнопки
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     TypeHandler,
     ContextTypes,
-    # CallbackQueryHandler, # <--- Раскомментируем, если будем обрабатывать нажатия
+    # CallbackQueryHandler,
 )
-from telegram.constants import ChatType, ParseMode # <--- Добавляем ParseMode для HTML
+from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
+import html # Импортируем html для escape
 
-# --- Настройки и переменные (без изменений) ---
+# --- Настройки и переменные ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -57,7 +59,7 @@ logger.info(f"MY_TELEGRAM_ID loaded: {MY_TELEGRAM_ID}")
 logger.info(f"GEMINI_API_KEY loaded: YES")
 logger.info(f"History length: {MAX_HISTORY_PER_CHAT}, Debounce delay: {DEBOUNCE_DELAY}s")
 
-# --- Функции для работы с историей (без изменений) ---
+# --- Функции истории, Gemini, обработки после задержки (без изменений) ---
 def update_chat_history(chat_id: int, role: str, text: str):
     if chat_id not in chat_histories:
         chat_histories[chat_id] = deque(maxlen=MAX_HISTORY_PER_CHAT)
@@ -67,7 +69,6 @@ def update_chat_history(chat_id: int, role: str, text: str):
 def get_formatted_history(chat_id: int) -> list:
     return list(chat_histories.get(chat_id, []))
 
-# --- Функция для вызова Gemini API (без изменений) ---
 async def generate_gemini_response(chat_history: list) -> str | None:
     global gemini_model
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
@@ -93,59 +94,37 @@ async def generate_gemini_response(chat_history: list) -> str | None:
         logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True)
         return None
 
-# --- ИЗМЕНЕННАЯ: Функция обработки чата ПОСЛЕ задержки ---
 async def process_chat_after_delay(chat_id: int, sender_name: str, context: ContextTypes.DEFAULT_TYPE):
-    """Вызывается после задержки дебаунса для генерации и отправки ответа."""
     logger.info(f"Debounce timer expired for chat {chat_id}. Processing...")
     current_history = get_formatted_history(chat_id)
     gemini_response = await generate_gemini_response(current_history)
 
     if gemini_response:
-        update_chat_history(chat_id, "model", gemini_response) # Обновляем историю ДО отправки себе
+        # Обновляем историю ответом МОДЕЛИ (Gemini), а не нашим исходящим
+        update_chat_history(chat_id, "model", gemini_response)
 
-        # --- ИЗМЕНЕНИЯ: Русский UI, моноширинный текст и кнопка ---
         try:
-            # 1. Формируем текст сообщения на русском и с тегом <code>
-            # Используем html.escape для безопасности, если sender_name может содержать < > &
-            import html
             safe_sender_name = html.escape(sender_name)
-            # Оборачиваем ответ Gemini в <code>
             escaped_gemini_response = html.escape(gemini_response)
             reply_text = (
                 f"🤖 <b>Предложенный ответ для чата {chat_id}</b> (<i>{safe_sender_name}</i>):\n"
                 f"──────────────────\n"
-                f"<code>{escaped_gemini_response}</code>" # <--- Моноширинный текст
+                f"<code>{escaped_gemini_response}</code>"
             )
-
-            # 2. Создаем inline-кнопку
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отправить в чат", callback_data=f"send_{chat_id}")]
-                # Можно добавить другие кнопки, например, "Редактировать", "Отмена"
-            ])
-
-            # 3. Отправляем сообщение с кнопкой и HTML-разметкой
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Отправить в чат", callback_data=f"send_{chat_id}")]])
             await context.bot.send_message(
-                chat_id=MY_TELEGRAM_ID,
-                text=reply_text,
-                reply_markup=keyboard, # <--- Добавляем клавиатуру
-                parse_mode=ParseMode.HTML # <--- Указываем HTML
+                chat_id=MY_TELEGRAM_ID, text=reply_text, reply_markup=keyboard, parse_mode=ParseMode.HTML
             )
             logger.info(f"Sent suggested reply with button for chat {chat_id} to {MY_TELEGRAM_ID}")
-
         except TelegramError as e:
             logger.error(f"Failed to send suggested reply (HTML) to {MY_TELEGRAM_ID}: {e}")
-            # Пробуем отправить как обычный текст в случае ошибки
-            try:
-                reply_text_plain = (
-                    f"🤖 Предложенный ответ для чата {chat_id} ({sender_name}):\n"
-                    f"──────────────────\n"
-                    f"{gemini_response}" # Без <code>
-                )
+            try: # Fallback to plain text
+                reply_text_plain = (f"🤖 Предложенный ответ для чата {chat_id} ({sender_name}):\n"
+                                  f"──────────────────\n{gemini_response}")
                 await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_plain)
                 logger.info(f"Sent suggested reply (plain fallback) for chat {chat_id} to {MY_TELEGRAM_ID}")
             except Exception as e2:
                 logger.error(f"Failed to send suggested reply (plain fallback) to {MY_TELEGRAM_ID}: {e2}")
-        # --- Конец изменений ---
     else:
         logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
 
@@ -153,30 +132,59 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, context: Cont
         del debounce_tasks[chat_id]
         logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
-# --- Обработчик бизнес-сообщений handle_business_update (без изменений) ---
+
+# --- ИЗМЕНЕННЫЙ Основной обработчик бизнес-сообщений ---
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"--- Received Business Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}")
-    business_message = update.business_message
-    if not business_message: logger.debug("Update does not contain a business_message."); return
+    # Логируем обновление для отладки структуры
+    # logger.info(f"--- Received Business Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}") # Раскомментируй если нужно
+
+    # Проверяем разные возможные поля для бизнес-сообщений
+    business_message = update.business_message or update.edited_business_message
+    if not business_message:
+        logger.debug("Update does not contain a processable business_message or edited_business_message.")
+        return
+
     chat = business_message.chat
-    sender = business_message.from_user
+    sender = business_message.from_user # Пользователь, инициировавший действие
     text = business_message.text
-    if not text: logger.debug(f"Ignoring non-text business message in chat {chat.id}"); return
-    if sender and sender.id == MY_TELEGRAM_ID: logger.info(f"Ignoring outgoing msg from {MY_TELEGRAM_ID}"); return
+
+    # Игнорируем сообщения без текста (фото, стикеры и т.д.)
+    if not text:
+        logger.debug(f"Ignoring non-text business message in chat {chat.id}")
+        return
 
     chat_id = chat.id
+
+    # --- ОПРЕДЕЛЯЕМ, ВХОДЯЩЕЕ ИЛИ ИСХОДЯЩЕЕ ---
+    # Предполагаем, что если sender ЕСТЬ и его ID совпадает с НАШИМ ID,
+    # то это сообщение, отправленное НАМИ (исходящее).
+    # Это может потребовать проверки по реальным логам Business API.
+    is_outgoing = sender and sender.id == MY_TELEGRAM_ID
+
+    if is_outgoing:
+        logger.info(f"Processing OUTGOING message in chat {chat_id}")
+        # Просто добавляем наше сообщение в историю как 'model'
+        update_chat_history(chat_id, "model", text)
+        # Ничего больше не делаем (не запускаем таймер, не генерим ответ)
+        return # <--- Важно завершить обработку здесь
+
+    # --- Если сообщение ВХОДЯЩЕЕ ---
+    logger.info(f"Processing INCOMING message from user {sender.id if sender else 'Unknown'} in chat {chat_id}")
     sender_name = "Собеседник"
     if sender: sender_name = sender.first_name or f"User_{sender.id}"
 
-    update_chat_history(chat_id, "user", text) # Обновляем историю сразу
+    # 1. Обновляем историю входящим сообщением ('user')
+    update_chat_history(chat_id, "user", text)
 
-    if chat_id in debounce_tasks: # Отменяем старую задачу
+    # 2. Отменяем предыдущую задачу дебаунса
+    if chat_id in debounce_tasks:
         logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
         try: debounce_tasks[chat_id].cancel()
         except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
 
+    # 3. Создаем и запускаем НОВУЮ задачу с задержкой
     logger.info(f"Scheduling new response generation for chat {chat_id} in {DEBOUNCE_DELAY}s")
-    async def delayed_processing(): # Создаем новую задачу
+    async def delayed_processing():
         try:
             await asyncio.sleep(DEBOUNCE_DELAY)
             logger.debug(f"Debounce delay finished for chat {chat_id}. Starting processing.")
@@ -185,23 +193,24 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
             logger.info(f"Debounce task for chat {chat_id} was cancelled.")
         except Exception as e:
             logger.error(f"Error in delayed processing for chat {chat_id}: {e}", exc_info=True)
+
     task = asyncio.create_task(delayed_processing())
     debounce_tasks[chat_id] = task
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
-# --- Функция post_init ---
+
+# --- post_init и __main__ (без изменений) ---
 async def post_init(application: Application):
     webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
     logger.info(f"Attempting to set webhook using: {webhook_full_url}")
     try:
-        # Добавляем 'callback_query' в allowed_updates, если планируем обрабатывать нажатия кнопок
         await application.bot.set_webhook(
             url=webhook_full_url,
             allowed_updates=[
                 "message", "edited_message", "channel_post", "edited_channel_post",
                 "business_connection", "business_message", "edited_business_message",
                 "deleted_business_messages", "my_chat_member", "chat_member",
-                "callback_query" # <--- Добавлено для кнопок
+                "callback_query"
              ],
             drop_pending_updates=True
         )
@@ -212,7 +221,6 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-# --- Основная точка входа ---
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
     try:
@@ -223,26 +231,11 @@ if __name__ == "__main__":
         logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Основной обработчик для всех обновлений
     application.add_handler(TypeHandler(Update, handle_business_update))
-    # --- ЕСЛИ нужно будет обрабатывать нажатие кнопки ---
+    # Закомментированный обработчик кнопки остается на будущее
     # from telegram.ext import CallbackQueryHandler
-    # async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #     query = update.callback_query
-    #     await query.answer() # Отвечаем на колбэк, чтобы кнопка перестала "крутиться"
-    #     callback_data = query.data
-    #     logger.info(f"Button pressed with data: {callback_data}")
-    #     if callback_data and callback_data.startswith("send_"):
-    #         target_chat_id = callback_data.split("_", 1)[1]
-    #         # Здесь нужна логика получения ТЕКСТА сообщения (из query.message.text?)
-    #         # и отправки его в target_chat_id от имени бизнес-аккаунта
-    #         # Например:
-    #         # original_reply_text = query.message.text # Или parse query.message.html_text
-    #         # await context.bot.send_message(chat_id=target_chat_id, text=original_reply_text)
-    #         await query.edit_message_text(text=f"{query.message.text}\n\n[Кнопка обработана - отправка пока не реализована]", parse_mode=ParseMode.HTML)
+    # async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE): ...
     # application.add_handler(CallbackQueryHandler(button_handler))
-    # --- Конец блока обработки кнопки ---
 
     logger.info("Application built. Starting webhook listener...")
     try:
