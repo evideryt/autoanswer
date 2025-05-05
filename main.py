@@ -28,21 +28,17 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443))
 MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
-# --- Переменные для "неофициального" Qwen API ---
-QWEN_TOKEN = os.environ.get("QWEN_API_KEY") # Используем QWEN_API_KEY для токена
-# Используем URL из инструкции
+QWEN_TOKEN = os.environ.get("QWEN_API_KEY")
 QWEN_CHAT_API_ENDPOINT = "https://chat.qwenlm.ai/api/chat/completions"
-
 HISTORY_SIZE = 5
 DEBOUNCE_DELAY = 15
-MY_NAME_IN_HISTORY = "киткат" # Используем твой ник
+MY_NAME_IN_HISTORY = "киткат"
 
-# --- Проверки переменных ---
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
 if not MY_TELEGRAM_ID_STR: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); exit()
-if not QWEN_TOKEN: logger.critical("CRITICAL: Missing QWEN_API_KEY (used for chat token)"); exit() # Проверка токена
+if not QWEN_TOKEN: logger.critical("CRITICAL: Missing QWEN_API_KEY (used for chat token)"); exit()
 try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
 except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID is not valid int"); exit()
 
@@ -54,36 +50,25 @@ logger.info(f"QWEN_TOKEN loaded: YES")
 logger.info(f"Using Qwen Chat API Endpoint: {QWEN_CHAT_API_ENDPOINT}")
 logger.info(f"History size: {HISTORY_SIZE}, Debounce delay: {DEBOUNCE_DELAY}s")
 
-# --- Хранилища в памяти ---
 chat_histories = {}
 debounce_timers = {}
 
-# --- Новая Функция для взаимодействия с Qwen Chat API ---
+# --- ИЗМЕНЕННАЯ Функция для взаимодействия с Qwen Chat API ---
 async def get_qwen_chat_response(history: deque) -> str | None:
     """Отправляет историю в Qwen Chat API и возвращает ответ."""
     logger.info(f"Requesting Qwen Chat API response for history (size {len(history)})")
 
-    # --- Форматируем историю для Qwen Chat API ---
     messages_for_qwen = []
     for sender_name, _, text in history:
         role = "assistant" if sender_name == MY_NAME_IN_HISTORY else "user"
-        # Добавляем поля из инструкции
         messages_for_qwen.append({
-            "role": role,
-            "content": text,
-            "extra": {}, # Поле из инструкции
-            "chat_type": "t2t" # Поле из инструкции
+            "role": role, "content": text, "extra": {}, "chat_type": "t2t"
         })
 
-    # --- Тело запроса к Qwen Chat API ---
     payload = {
-        "chat_type": "t2t", # Поле из инструкции
-        "messages": messages_for_qwen,
-        "model": "qwen-max-latest", # Модель из инструкции
-        "stream": False # Поле из инструкции
+        "chat_type": "t2t", "messages": messages_for_qwen,
+        "model": "qwen-max-latest", "stream": False
     }
-
-    # --- Заголовки из инструкции ---
     headers = {
         "Authorization": f"Bearer {QWEN_TOKEN}",
         "Content-Type": "application/json",
@@ -91,48 +76,55 @@ async def get_qwen_chat_response(history: deque) -> str | None:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client: # Увеличим таймаут еще больше
+        async with httpx.AsyncClient(timeout=45.0) as client:
             logger.debug(f"Sending POST to {QWEN_CHAT_API_ENDPOINT}")
-            logger.debug(f"Headers: {headers}") # Логируем заголовки (кроме токена)
-            # Не логируем payload целиком из-за потенциального размера истории
+            # Логируем заголовки без токена для безопасности
+            logger.debug(f"Headers: Authorization=Bearer ****, Content-Type={headers['Content-Type']}, User-Agent={headers['User-Agent']}")
             logger.debug(f"Payload messages count: {len(messages_for_qwen)}")
 
             response = await client.post(QWEN_CHAT_API_ENDPOINT, json=payload, headers=headers)
 
-            logger.debug(f"Qwen Chat API Status Code: {response.status_code}")
-            # Логируем ответ только если это ошибка, чтобы не засорять логи успехом
-            if response.status_code != 200:
-                 logger.debug(f"Qwen Chat API Raw Response (Error): {response.text}")
+            logger.info(f"Qwen Chat API Status Code: {response.status_code}")
+            # Логируем СЫРОЙ ТЕКСТ ответа ПЕРЕД парсингом
+            raw_response_text = response.text
+            logger.info(f"Qwen Chat API Raw Response Text (first 500 chars): {raw_response_text[:500]}")
 
-            response.raise_for_status() # Проверка на HTTP ошибки (4xx, 5xx)
+            # Проверяем статус ПОСЛЕ логирования текста
+            response.raise_for_status() # Если статус 4xx или 5xx, вылетит исключение
 
-            result = response.json()
-            logger.debug(f"Qwen Chat API Raw Response (Success): {json.dumps(result, indent=2)}")
+            # Оборачиваем парсинг JSON в try-except
+            try:
+                result = response.json()
+                logger.debug(f"Qwen Chat API Parsed JSON: {json.dumps(result, indent=2)}")
 
-            # --- Извлекаем ответ (согласно последнему сниппету) ---
-            generated_text = result.get("choices", [{}])[0].get("message", {}).get("content")
+                # Извлекаем ответ
+                generated_text = result.get("choices", [{}])[0].get("message", {}).get("content")
 
-            if generated_text:
-                logger.info(f"Received Qwen Chat API response: '{generated_text[:50]}...'")
-                return generated_text.strip()
-            else:
-                logger.error(f"Qwen Chat API response does not contain expected text field 'choices[0].message.content'. Response: {result}")
+                if generated_text:
+                    logger.info(f"Received Qwen Chat API response: '{generated_text[:50]}...'")
+                    return generated_text.strip()
+                else:
+                    logger.error(f"Qwen Chat API JSON response missing 'choices[0].message.content'. Response: {result}")
+                    return None
+            except json.JSONDecodeError as json_err:
+                logger.error(f"Failed to decode Qwen Chat API response as JSON: {json_err}")
+                # Логируем текст, который вызвал ошибку JSON
+                logger.error(f"Raw response text that caused JSON error: {raw_response_text}")
                 return None
 
     except httpx.HTTPStatusError as e:
+        # Этот лог уже содержит текст ошибки из response.text
         logger.error(f"Qwen Chat API request failed with status {e.response.status_code}: {e.response.text}")
         return None
     except httpx.RequestError as e:
         logger.error(f"Qwen Chat API request failed: {e}")
         return None
     except Exception as e:
-        logger.error(f"Error processing Qwen Chat API response: {e}", exc_info=True)
+        logger.error(f"Unexpected error processing Qwen Chat API request/response: {type(e).__name__}: {e}", exc_info=True)
         return None
-
 
 # --- Отложенная задача: Запрос к Qwen и ответ в чат ---
 async def trigger_qwen_response(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Получает ответ от Qwen Chat API и отправляет его в оригинальный чат."""
     logger.info(f"Debounce timer expired for chat {chat_id}. Triggering Qwen response.")
     if chat_id not in chat_histories:
         logger.warning(f"History not found for chat {chat_id} when Qwen trigger expired.")
@@ -143,24 +135,18 @@ async def trigger_qwen_response(chat_id: int, context: ContextTypes.DEFAULT_TYPE
         logger.info(f"History for chat {chat_id} is empty. Nothing to send to Qwen.")
         return
 
-    # Получаем ответ от Qwen Chat API
-    qwen_response = await get_qwen_chat_response(history) # <--- Вызываем новую функцию
+    qwen_response = await get_qwen_chat_response(history) # Вызываем обновленную функцию
 
     if qwen_response:
         try:
-            # Отправляем ответ в ОРИГИНАЛЬНЫЙ чат
             sent_message = await context.bot.send_message(
-                chat_id=chat_id,
-                text=qwen_response,
+                chat_id=chat_id, text=qwen_response,
             )
             logger.info(f"Successfully sent Qwen response to chat {chat_id}.")
-
-            # Добавляем ответ бота в историю
             response_timestamp = datetime.now(timezone.utc)
             if chat_id in chat_histories:
                 chat_histories[chat_id].append((MY_NAME_IN_HISTORY, response_timestamp, qwen_response))
                 logger.debug(f"Added bot's response to history for chat {chat_id}. History size: {len(chat_histories[chat_id])}")
-
         except TelegramError as e:
             logger.error(f"Failed to send Qwen response to chat {chat_id}: {e}")
     else:
@@ -169,10 +155,8 @@ async def trigger_qwen_response(chat_id: int, context: ContextTypes.DEFAULT_TYPE
     if chat_id in debounce_timers:
         del debounce_timers[chat_id]
 
-
-# --- Обработчик бизнес-сообщений ---
+# --- Обработчик бизнес-сообщений (без изменений) ---
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # (Логика этой функции остается без изменений, как в предыдущем ответе)
     message = update.business_message
     if not message: return
     chat_id = message.chat.id
@@ -228,24 +212,19 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-# --- Основная точка входа ---
+# --- Основная точка входа (без изменений) ---
 if __name__ == "__main__":
-    logger.info("Initializing Qwen Chat API Autoresponder Bot...") # Новое имя
-
+    logger.info("Initializing Qwen Chat API Autoresponder Bot...")
     application = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
-
-    # --- Регистрация обработчиков ---
     application.add_handler(TypeHandler(Update, log_all_updates), group=-1)
     application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message))
-
     logger.info("Application built. Starting webhook listener...")
     try:
-        # Эту переменную определяем здесь, т.к. она нужна для run_webhook
         webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
         logger.info("Running application.run_webhook...")
         webhook_runner = application.run_webhook(
@@ -256,7 +235,6 @@ if __name__ == "__main__":
         )
         logger.info(f"application.run_webhook returned: {type(webhook_runner)}")
         asyncio.run(webhook_runner)
-
     except ValueError as e:
         logger.critical(f"CRITICAL ERROR during asyncio.run: {e}", exc_info=True)
     except Exception as e:
