@@ -2,19 +2,21 @@ import logging
 import os
 import asyncio
 import json
+from datetime import datetime, timezone # Для работы с датами
+from collections import deque # Для хранения истории
 
 from telegram import Update
 from telegram.ext import (
     Application,
     MessageHandler,
-    filters,        # Оставляем для UpdateType
+    filters,
     ContextTypes,
     TypeHandler,
 )
 from telegram.constants import ChatType
 from telegram.error import TelegramError
 
-# --- Настройки и переменные (без изменений) ---
+# --- Настройки и переменные ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -24,128 +26,129 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443))
-MY_TELEGRAM_ID = os.environ.get("MY_TELEGRAM_ID")
+MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID") # Читаем как строку
+HISTORY_SIZE = 5 # Храним последние 5 сообщений
+DEBOUNCE_DELAY = 15 # Задержка в секундах
 
+# --- Проверки переменных ---
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
-if not MY_TELEGRAM_ID: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); exit()
-try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID)
+if not MY_TELEGRAM_ID_STR: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); exit()
+try:
+    MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
 except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID is not valid int"); exit()
 
 logger.info(f"BOT_TOKEN loaded: YES")
 logger.info(f"WEBHOOK_URL loaded: {WEBHOOK_URL}")
 logger.info(f"PORT configured: {PORT}")
 logger.info(f"MY_TELEGRAM_ID (forward target) loaded: {MY_TELEGRAM_ID}")
+logger.info(f"History size: {HISTORY_SIZE}, Debounce delay: {DEBOUNCE_DELAY}s")
+
+# --- Хранилища в памяти ---
+# {chat_id: deque([(sender_name, timestamp, text), ...], maxlen=HISTORY_SIZE)}
+chat_histories = {}
+# {chat_id: asyncio.Task} - для отслеживания и отмены таймеров
+debounce_timers = {}
+
+# --- Функция форматирования времени ---
+def format_timestamp(ts: int) -> str:
+    """Форматирует UNIX timestamp в читаемую строку ДД.ММ.ГГГГ ЧЧ:ММ:СС"""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    # Можно настроить формат и часовой пояс по желанию
+    return dt.strftime("%d.%m.%Y %H:%M:%S UTC")
+
+# --- Отложенная задача отправки истории ---
+async def send_history_to_owner(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Форматирует и отправляет историю чата владельцу."""
+    logger.info(f"Debounce timer expired for chat {chat_id}. Preparing to send history.")
+    if chat_id not in chat_histories:
+        logger.warning(f"History not found for chat {chat_id} when timer expired.")
+        return
+
+    history = chat_histories[chat_id]
+    if not history:
+        logger.info(f"History for chat {chat_id} is empty. Nothing to send.")
+        return
+
+    formatted_history = [f"История чата (ID: {chat_id}):"]
+    for sender_name, timestamp, text in history:
+        time_str = format_timestamp(timestamp)
+        # Экранируем имя и текст на всякий случай
+        safe_sender = sender_name.replace("<", "<").replace(">", ">").replace("&", "&")
+        safe_text = text.replace("<", "<").replace(">", ">").replace("&", "&")
+        formatted_history.append(f"<b>{safe_sender}</b> [{time_str}]:\n{safe_text}")
+
+    final_text = "\n\n".join(formatted_history)
+
+    try:
+        await context.bot.send_message(
+            chat_id=MY_TELEGRAM_ID,
+            text=final_text,
+            parse_mode='HTML' # Используем HTML для жирного шрифта
+        )
+        logger.info(f"Successfully sent history for chat {chat_id} to owner {MY_TELEGRAM_ID}.")
+    except TelegramError as e:
+        logger.error(f"Failed to send history for chat {chat_id} to owner {MY_TELEGRAM_ID}: {e}")
+    finally:
+        # Удаляем таймер из словаря после выполнения
+        if chat_id in debounce_timers:
+            del debounce_timers[chat_id]
+
+
+# --- Обработчик бизнес-сообщений ---
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает входящие и ИСХОДЯЩИЕ бизнес-сообщения."""
+    message = update.business_message
+    if not message: return # На всякий случай
+
+    chat_id = message.chat.id
+    sender = message.from_user
+    timestamp = message.date # UNIX timestamp
+    text = message.text or "[нетекстовое сообщение]" # Если текста нет
+
+    if not sender:
+        logger.warning(f"Received business_message without sender info in chat {chat_id}. Update: {update.to_json()}")
+        return
+
+    sender_id = sender.id
+    sender_name = sender.first_name or f"ID:{sender_id}" # Используем имя или ID
+
+    logger.info(f"Received business message from {sender_name}({sender_id}) in chat {chat_id}")
+
+    # --- Добавляем сообщение в историю ---
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = deque(maxlen=HISTORY_SIZE)
+
+    # Сохраняем кортеж (имя, время, текст)
+    chat_histories[chat_id].append((sender_name, timestamp, text))
+    logger.debug(f"Added message to history for chat {chat_id}. History size: {len(chat_histories[chat_id])}")
+
+    # --- Логика задержки (Debounce) ---
+    # Запускаем таймер только если сообщение НЕ от владельца бота
+    if sender_id != MY_TELEGRAM_ID:
+        # Отменяем предыдущий таймер для этого чата, если он есть
+        if chat_id in debounce_timers:
+            debounce_timers[chat_id].cancel()
+            logger.debug(f"Cancelled previous debounce timer for chat {chat_id}")
+
+        # Запускаем новый таймер
+        logger.debug(f"Starting new {DEBOUNCE_DELAY}s debounce timer for chat {chat_id}")
+        new_timer = asyncio.create_task(
+            asyncio.sleep(DEBOUNCE_DELAY, result=chat_id) # Передаем chat_id в результат sleep
+        )
+        # Добавляем callback, который вызовет send_history_to_owner
+        new_timer.add_done_callback(
+            lambda task: asyncio.create_task(send_history_to_owner(task.result(), context)) if not task.cancelled() else None
+        )
+        debounce_timers[chat_id] = new_timer
+    else:
+        logger.debug(f"Message from owner ({sender_id}). History updated, debounce timer not started/reset.")
+
 
 # --- Обработчик для логирования ВСЕХ обновлений (оставляем для отладки) ---
 async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"--- Received Raw Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}")
-
-# --- ИЗМЕНЕННЫЙ Основной обработчик сообщений ---
-async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает БИЗНЕС-сообщения и пересылает их пользователю."""
-    logger.info(">>> handle_business_message triggered <<<") # Поменяли имя функции в логе
-
-    # --- ИЗМЕНЕНИЕ: Получаем сообщение из business_message ---
-    message = update.business_message
-
-    # Проверка на всякий случай, хотя фильтр должен это обеспечить
-    if not message:
-        logger.debug("handle_business_message: Update does not contain a business_message.")
-        return
-
-    # --- ИЗМЕНЕНИЕ: Остальная логика теперь работает с 'message', который равен update.business_message ---
-    original_chat = message.chat
-    # В бизнес-сообщении 'from' - это реальный отправитель
-    sender = message.from_user
-
-    # Проверка на пересылку из целевого чата (остается)
-    if original_chat.id == MY_TELEGRAM_ID:
-        logger.debug(f"handle_business_message: Ignoring message from target chat {MY_TELEGRAM_ID}.")
-        return
-
-    # Проверка на сообщения от бота (маловероятно для business_message, но пусть будет)
-    if sender and sender.id == context.bot.id:
-        logger.debug("handle_business_message: Ignoring message from bot itself.")
-        return
-
-    # Формирование информации (без изменений)
-    sender_info = "Unknown Sender"
-    if sender:
-        sender_info = f"{sender.first_name}"
-        if sender.last_name: sender_info += f" {sender.last_name}"
-        if sender.username: sender_info += f" (@{sender.username})"
-        sender_info += f" (ID: {sender.id})"
-
-    chat_info = f"Chat ID: {original_chat.id}"
-    if original_chat.title: # Маловероятно для личных чатов, но вдруг бот подключен к бизнес-группе
-        chat_info = f"'{original_chat.title}' ({original_chat.id})"
-    elif original_chat.type == ChatType.PRIVATE:
-         # Используем имя собеседника из chat, т.к. это личный чат
-         chat_user_name = original_chat.first_name
-         if original_chat.last_name: chat_user_name += f" {original_chat.last_name}"
-         if original_chat.username: chat_user_name += f" (@{original_chat.username})"
-         chat_info = f"Private Chat with {chat_user_name} ({original_chat.id})"
-
-    message_text = message.text
-    if not message_text:
-        # У бизнес-сообщений может не быть effective_attachment, проверяем стандартные поля
-        if message.photo: message_text = "[Photo]"
-        elif message.video: message_text = "[Video]"
-        elif message.audio: message_text = "[Audio]"
-        elif message.voice: message_text = "[Voice Message]"
-        elif message.document: message_text = "[Document]"
-        elif message.sticker: message_text = f"[Sticker: {message.sticker.emoji}]"
-        else: message_text = "[Non-text/Unknown Attachment]"
-        # Добавляем подпись, если она есть
-        if message.caption: message_text += f"\nCaption: {message.caption}"
-
-    # Функция экранирования (без изменений)
-    def escape_markdown_v2(text: str) -> str:
-        escape_chars = r'_*[]()~`>#+-=|{}.!'
-        escaped_text = ""
-        for char in str(text): # Убедимся, что работаем со строкой
-            if char in escape_chars: escaped_text += f'\\{char}'
-            else: escaped_text += char
-        return escaped_text
-
-    # Экранируем части текста перед вставкой в Markdown
-    safe_sender_info = escape_markdown_v2(sender_info)
-    safe_chat_info = escape_markdown_v2(chat_info)
-    safe_message_text = escape_markdown_v2(message_text)
-
-    forward_text = (
-        f"📩 *Business Message*\n\n" # Поменяли заголовок для ясности
-        f"*From:* {safe_sender_info}\n"
-        f"*In:* {safe_chat_info}\n"
-        f"───────\n"
-        f"{safe_message_text}"
-    )
-
-    # Отправка сообщения (без изменений)
-    try:
-        await context.bot.send_message(
-            chat_id=MY_TELEGRAM_ID, text=forward_text, parse_mode='MarkdownV2'
-        )
-        logger.info(f"handle_business_message: Forwarded message from chat {original_chat.id} to {MY_TELEGRAM_ID}")
-    except TelegramError as e:
-        logger.error(f"handle_business_message: Failed to forward message (MarkdownV2) to {MY_TELEGRAM_ID}: {e}")
-        try:
-             forward_text_plain = (
-                f"📩 Business Message\n\n"
-                f"From: {sender_info}\n"
-                f"In: {chat_info}\n"
-                f"───────\n"
-                f"{message_text}"
-             )
-             await context.bot.send_message(
-                chat_id=MY_TELEGRAM_ID, text=forward_text_plain, parse_mode=None
-             )
-             logger.info(f"handle_business_message: Forwarded message (plain text retry) to {MY_TELEGRAM_ID}")
-        except Exception as e2:
-             logger.error(f"handle_business_message: Failed to forward message (plain text retry) to {MY_TELEGRAM_ID}: {e2}")
-
 
 # --- Функция post_init (без изменений) ---
 async def post_init(application: Application):
@@ -167,10 +170,9 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-
 # --- Основная точка входа ---
 if __name__ == "__main__":
-    logger.info("Initializing Telegram Business Forwarder Bot...")
+    logger.info("Initializing Telegram Business Debounce Bot...")
 
     application = (
         Application.builder()
@@ -180,15 +182,8 @@ if __name__ == "__main__":
     )
 
     # --- Регистрация обработчиков ---
-    # Логгер ВСЕХ обновлений (оставляем первым)
-    application.add_handler(TypeHandler(Update, log_all_updates), group=-1)
-
-    # --- ИЗМЕНЕНИЕ: Ловим BUSINESS_MESSAGE, а не MESSAGE ---
-    # Убираем фильтр ~filters.COMMAND, т.к. в бизнес-сообщениях команд скорее всего нет
-    application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message))
-
-    # Можно добавить обработчик и для отредактированных бизнес-сообщений, если нужно
-    # application.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, handle_edited_business_message))
+    application.add_handler(TypeHandler(Update, log_all_updates), group=-1) # Логгер
+    application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message)) # Обработчик бизнес-сообщений
 
     logger.info("Application built. Starting webhook listener...")
     try:
