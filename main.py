@@ -1,18 +1,16 @@
 import logging
 import os
 import asyncio
-# Убрали psycopg, random и т.д.
 
 from telegram import Update
-# Убрали ChatMember, User - пока не нужны для простой пересылки
 from telegram.ext import (
     Application,
     MessageHandler, # Нужен только обработчик сообщений
-    filters,
+    filters,        # Импортируем filters, чтобы использовать UpdateType
     ContextTypes,
 )
-from telegram.constants import ChatType # Понадобится для определения типа чата
-from telegram.error import TelegramError # Для отлова ошибок отправки
+from telegram.constants import ChatType
+from telegram.error import TelegramError
 
 # --- Настройки и переменные ---
 logging.basicConfig(
@@ -25,9 +23,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443))
-# !!! ВАЖНО: Укажи СВОЙ Telegram ID в переменных окружения !!!
-# Это ID чата, КУДА бот будет пересылать сообщения.
-# Обычно это твой личный ID (для пересылки в "Избранное") или ID личного чата с ботом.
 MY_TELEGRAM_ID = os.environ.get("MY_TELEGRAM_ID")
 
 # --- КРИТИЧЕСКИЕ ПРОВЕРКИ ПЕРЕМЕННЫХ ---
@@ -38,118 +33,109 @@ if not MY_TELEGRAM_ID:
     logger.critical("CRITICAL: Missing MY_TELEGRAM_ID environment variable. Set it to your Telegram User ID.")
     exit()
 try:
-    # Пытаемся преобразовать ID в число, чтобы отловить некорректные значения
     MY_TELEGRAM_ID = int(MY_TELEGRAM_ID)
 except ValueError:
     logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID}') is not a valid integer.")
     exit()
 
-
 logger.info(f"BOT_TOKEN loaded: YES")
 logger.info(f"WEBHOOK_URL loaded: {WEBHOOK_URL}")
-logger.info(f"PORT configured: {PORT}")
+logger.info(f"PORT configured: {PORT}") # Render сам подставит значение $PORT
 logger.info(f"MY_TELEGRAM_ID (forward target) loaded: {MY_TELEGRAM_ID}")
 
 # --- Основной обработчик сообщений ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ВСЕ входящие сообщения и пересылает их пользователю."""
-    # Логируем все обновление, чтобы видеть структуру бизнес-сообщений
-    logger.info(f"Received update: {update.to_json()}") # Логируем как JSON для читаемости
+    logger.info(f"Received update: {update.to_json()}") # Логируем все обновление
 
     message = update.message
-
-    # Проверяем, есть ли вообще сообщение в обновлении
     if not message:
         logger.debug("Update does not contain a message.")
         return
 
-    # Получаем информацию о чате и отправителе из ОРИГИНАЛЬНОГО сообщения
     original_chat = message.chat
-    sender = message.from_user # Это может быть реальный отправитель или твой аккаунт
+    sender = message.from_user
 
-    # --- Важная проверка: НЕ пересылать сообщения ИЗ чата, КУДА мы пересылаем ---
-    # Это предотвращает бесконечный цикл, если MY_TELEGRAM_ID - это ID чата с ботом,
-    # и ты сам пишешь боту в этот чат.
     if original_chat.id == MY_TELEGRAM_ID:
         logger.debug(f"Ignoring message from the forward target chat ({MY_TELEGRAM_ID}).")
         return
-
-    # --- Вторая важная проверка: НЕ пересылать сообщения, отправленные самим ботом ---
-    # (на всякий случай, хотя они не должны приходить через Business API таким образом)
     if sender and sender.id == context.bot.id:
         logger.debug("Ignoring message from the bot itself.")
         return
 
-    # Формируем информацию об отправителе
     sender_info = "Unknown Sender"
     if sender:
         sender_info = f"{sender.first_name}"
-        if sender.last_name:
-            sender_info += f" {sender.last_name}"
-        if sender.username:
-            sender_info += f" (@{sender.username})"
+        if sender.last_name: sender_info += f" {sender.last_name}"
+        if sender.username: sender_info += f" (@{sender.username})"
         sender_info += f" (ID: {sender.id})"
 
-    # Формируем информацию о чате
     chat_info = f"Chat ID: {original_chat.id}"
     if original_chat.title:
         chat_info = f"'{original_chat.title}' ({original_chat.id})"
     elif original_chat.type == ChatType.PRIVATE:
-        # Для личных чатов title нет, можно использовать имя собеседника, если оно не совпадает с отправителем
-        # Но для простоты пока оставим только ID
          chat_info = f"Private Chat ({original_chat.id})"
 
-
-    # Получаем текст сообщения (или заглушку для других типов)
     message_text = message.text
     if not message_text:
-        # Если это не текст (фото, видео, стикер и т.д.)
         message_text = f"[Non-text message type: {message.effective_attachment.mime_type if message.effective_attachment else 'Unknown'}]"
-        # Можно добавить обработку подписей к медиа:
-        if message.caption:
-             message_text += f"\nCaption: {message.caption}"
+        if message.caption: message_text += f"\nCaption: {message.caption}"
 
-    # Собираем финальное сообщение для пересылки
+    # Экранируем символы Markdown V2 для безопасности
+    def escape_markdown_v2(text: str) -> str:
+        # Символы для экранирования в MarkdownV2
+        escape_chars = r'_*[]()~`>#+-=|{}.!'
+        # Создаем регулярное выражение для поиска этих символов
+        # Нужно экранировать сам символ '-' в диапазоне или списке
+        # escape_pattern = re.compile(f'([{re.escape(escape_chars)}])') # Старый вариант с re
+        # Простой вариант без re
+        escaped_text = ""
+        for char in str(text): # Убедимся, что работаем со строкой
+            if char in escape_chars:
+                escaped_text += f'\\{char}'
+            else:
+                escaped_text += char
+        return escaped_text
+
+    # Экранируем части текста перед вставкой в Markdown
+    safe_sender_info = escape_markdown_v2(sender_info)
+    safe_chat_info = escape_markdown_v2(chat_info)
+    safe_message_text = escape_markdown_v2(message_text) # Экранируем и сам текст сообщения
+
     forward_text = (
         f"📩 *New Message*\n\n"
-        f"*From:* {sender_info}\n"
-        f"*In:* {chat_info}\n"
+        f"*From:* {safe_sender_info}\n"
+        f"*In:* {safe_chat_info}\n"
         f"───────\n"
-        f"{message_text}"
+        f"{safe_message_text}" # Используем экранированный текст
     )
 
-    # Отправляем сообщение в указанный MY_TELEGRAM_ID
     try:
         await context.bot.send_message(
             chat_id=MY_TELEGRAM_ID,
             text=forward_text,
-            parse_mode='MarkdownV2' # Используем Markdown для форматирования *From*, *In*
-            # Важно: Если в sender_info или message_text могут быть Markdown символы,
-            # их нужно экранировать перед отправкой! Но для теста пока оставим так.
+            parse_mode='MarkdownV2'
         )
         logger.info(f"Forwarded message from chat {original_chat.id} to {MY_TELEGRAM_ID}")
     except TelegramError as e:
-        logger.error(f"Failed to forward message to {MY_TELEGRAM_ID}: {e}")
-        # Можно попробовать отправить без форматирования в случае ошибки парсинга Markdown
-        if "can't parse entities" in str(e).lower():
-            logger.warning("Retrying forward without Markdown...")
-            try:
-                 # Убираем Markdown символы из заголовков
-                 forward_text_plain = (
-                    f"📩 New Message\n\n"
-                    f"From: {sender_info}\n" # Без *
-                    f"In: {chat_info}\n"     # Без *
-                    f"───────\n"
-                    f"{message_text}" # Сам текст оставляем как есть
-                 )
-                 await context.bot.send_message(
-                    chat_id=MY_TELEGRAM_ID,
-                    text=forward_text_plain,
-                    parse_mode=None
-                 )
-                 logger.info(f"Forwarded message (plain text) from chat {original_chat.id} to {MY_TELEGRAM_ID}")
-            except Exception as e2:
-                 logger.error(f"Failed to forward message (plain text retry) to {MY_TELEGRAM_ID}: {e2}")
+        logger.error(f"Failed to forward message to {MY_TELEGRAM_ID} (MarkdownV2): {e}")
+        # Попробуем отправить как обычный текст, если Markdown не сработал
+        try:
+            # Собираем текст без Markdown символов
+             forward_text_plain = (
+                f"📩 New Message\n\n"
+                f"From: {sender_info}\n" # Обычный текст
+                f"In: {chat_info}\n"     # Обычный текст
+                f"───────\n"
+                f"{message_text}"      # Обычный текст
+             )
+             await context.bot.send_message(
+                chat_id=MY_TELEGRAM_ID,
+                text=forward_text_plain,
+                parse_mode=None
+             )
+             logger.info(f"Forwarded message (plain text retry) from chat {original_chat.id} to {MY_TELEGRAM_ID}")
+        except Exception as e2:
+             logger.error(f"Failed to forward message (plain text retry) to {MY_TELEGRAM_ID}: {e2}")
 
 
 # --- Функция установки вебхука (без изменений) ---
@@ -164,10 +150,7 @@ async def post_init(application: Application):
     try:
         await application.bot.set_webhook(
             url=webhook_full_url,
-            # Важно указать, какие типы обновлений мы хотим получать
-            # Для Business API могут понадобиться 'business_message', 'edited_business_message' и т.д.
-            # Но начнем с Update.ALL_TYPES, чтобы точно все поймать
-            allowed_updates=Update.ALL_TYPES,
+            allowed_updates=Update.ALL_TYPES, # Оставляем ALL_TYPES для теста
             drop_pending_updates=True
         )
         webhook_info = await application.bot.get_webhook_info()
@@ -184,8 +167,6 @@ async def post_init(application: Application):
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Forwarder Bot...")
 
-    # Базу данных и рекламу не инициализируем
-
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -193,10 +174,9 @@ if __name__ == "__main__":
         .build()
     )
 
-    # --- Регистрация ОДНОГО обработчика ---
+    # --- Регистрация ОДНОГО обработчика с ИСПРАВЛЕННЫМ фильтром ---
     # Ловим ВСЕ сообщения (текст, фото, стикеры и т.д.), не являющиеся командами
-    application.add_handler(MessageHandler(filters.MESSAGE & ~filters.COMMAND, handle_message))
-    # Можно добавить обработчик и для других типов, если понадобится, например, edited_message
+    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_message))
 
     logger.info("Application built. Starting webhook listener...")
     try:
