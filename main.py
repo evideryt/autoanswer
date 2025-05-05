@@ -1,71 +1,77 @@
 import logging
 import os
 import asyncio
+import json # Для красивого вывода JSON в лог
 
 from telegram import Update
 from telegram.ext import (
     Application,
-    MessageHandler, # Нужен только обработчик сообщений
-    filters,        # Импортируем filters, чтобы использовать ALL
+    MessageHandler,
+    filters,
     ContextTypes,
+    TypeHandler, # <--- Добавляем TypeHandler
 )
 from telegram.constants import ChatType
 from telegram.error import TelegramError
 
-# --- Настройки и переменные ---
+# --- Настройки и переменные (без изменений) ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- Переменные окружения ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443))
 MY_TELEGRAM_ID = os.environ.get("MY_TELEGRAM_ID")
 
-# --- КРИТИЧЕСКИЕ ПРОВЕРКИ ПЕРЕМЕННЫХ ---
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
-if not MY_TELEGRAM_ID:
-    logger.critical("CRITICAL: Missing MY_TELEGRAM_ID environment variable. Set it to your Telegram User ID.")
-    exit()
-try:
-    MY_TELEGRAM_ID = int(MY_TELEGRAM_ID)
-except ValueError:
-    logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID}') is not a valid integer.")
-    exit()
+if not MY_TELEGRAM_ID: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); exit()
+try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID)
+except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID is not valid int"); exit()
 
 logger.info(f"BOT_TOKEN loaded: YES")
 logger.info(f"WEBHOOK_URL loaded: {WEBHOOK_URL}")
 logger.info(f"PORT configured: {PORT}")
 logger.info(f"MY_TELEGRAM_ID (forward target) loaded: {MY_TELEGRAM_ID}")
 
-# --- Основной обработчик сообщений ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Логируем абсолютно все, что пришло в этот обработчик
-    logger.info(f"HANDLE_MESSAGE TRIGGERED! Update: {update.to_json()}")
+# --- НОВЫЙ Обработчик для логирования ВСЕХ обновлений ---
+async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Логирует любое полученное обновление в формате JSON."""
+    logger.info(f"--- Received Raw Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}")
+    # Мы не будем ничего делать с этим обновлением здесь, только логировать.
+    # Оно потом пойдет дальше к другим обработчикам (если они есть).
 
-    # Дальнейшая логика остается прежней, но теперь мы хотя бы увидим, вызывается ли функция
+# --- Основной обработчик сообщений (пока оставляем как есть) ---
+# Ожидаем, что он НЕ БУДЕТ срабатывать для Business сообщений,
+# но пусть будет на случай, если придут и обычные.
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает стандартные сообщения и пересылает их."""
+    logger.info(">>> handle_message triggered <<<") # Добавим лог, чтобы видеть, если он вдруг сработает
+
+    # Логируем JSON и здесь, чтобы сравнить, если сработает
+    logger.info(f"Update passed to handle_message: {update.to_json()}")
+
     message = update.message
     if not message:
-        # Логируем и другие типы апдейтов, если они не сообщение
-        logger.info(f"Update received, but it's not a standard message (e.g., {update.effective_update.__class__.__name__}).")
-        # Можно добавить логику для других типов, если интересно, но пока просто выходим
+        logger.debug("handle_message: Update does not contain a standard message.")
         return
 
     original_chat = message.chat
     sender = message.from_user
 
     if original_chat.id == MY_TELEGRAM_ID:
-        logger.debug(f"Ignoring message from the forward target chat ({MY_TELEGRAM_ID}).")
+        logger.debug(f"handle_message: Ignoring message from target chat {MY_TELEGRAM_ID}.")
         return
     if sender and sender.id == context.bot.id:
-        logger.debug("Ignoring message from the bot itself.")
+        logger.debug("handle_message: Ignoring message from bot itself.")
         return
 
+    # (Остальная логика пересылки из handle_message остается без изменений)
+    # ... (код форматирования и отправки сообщения) ...
     sender_info = "Unknown Sender"
     if sender:
         sender_info = f"{sender.first_name}"
@@ -88,10 +94,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         escape_chars = r'_*[]()~`>#+-=|{}.!'
         escaped_text = ""
         for char in str(text):
-            if char in escape_chars:
-                escaped_text += f'\\{char}'
-            else:
-                escaped_text += char
+            if char in escape_chars: escaped_text += f'\\{char}'
+            else: escaped_text += char
         return escaped_text
 
     safe_sender_info = escape_markdown_v2(sender_info)
@@ -105,16 +109,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"───────\n"
         f"{safe_message_text}"
     )
-
     try:
         await context.bot.send_message(
-            chat_id=MY_TELEGRAM_ID,
-            text=forward_text,
-            parse_mode='MarkdownV2'
+            chat_id=MY_TELEGRAM_ID, text=forward_text, parse_mode='MarkdownV2'
         )
-        logger.info(f"Forwarded message from chat {original_chat.id} to {MY_TELEGRAM_ID}")
+        logger.info(f"handle_message: Forwarded message from chat {original_chat.id} to {MY_TELEGRAM_ID}")
     except TelegramError as e:
-        logger.error(f"Failed to forward message to {MY_TELEGRAM_ID} (MarkdownV2): {e}")
+        logger.error(f"handle_message: Failed to forward message (MarkdownV2) to {MY_TELEGRAM_ID}: {e}")
         try:
              forward_text_plain = (
                 f"📩 New Message\n\n"
@@ -124,16 +125,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{message_text}"
              )
              await context.bot.send_message(
-                chat_id=MY_TELEGRAM_ID,
-                text=forward_text_plain,
-                parse_mode=None
+                chat_id=MY_TELEGRAM_ID, text=forward_text_plain, parse_mode=None
              )
-             logger.info(f"Forwarded message (plain text retry) from chat {original_chat.id} to {MY_TELEGRAM_ID}")
+             logger.info(f"handle_message: Forwarded message (plain text retry) to {MY_TELEGRAM_ID}")
         except Exception as e2:
-             logger.error(f"Failed to forward message (plain text retry) to {MY_TELEGRAM_ID}: {e2}")
+             logger.error(f"handle_message: Failed to forward message (plain text retry) to {MY_TELEGRAM_ID}: {e2}")
 
 
-# --- Функция установки вебхука (без изменений) ---
+# --- Функция post_init (без изменений) ---
 async def post_init(application: Application):
     webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
     logger.info(f"Attempting to set webhook using:")
@@ -145,7 +144,7 @@ async def post_init(application: Application):
     try:
         await application.bot.set_webhook(
             url=webhook_full_url,
-            allowed_updates=Update.ALL_TYPES, # Оставляем ALL_TYPES
+            allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True
         )
         webhook_info = await application.bot.get_webhook_info()
@@ -156,7 +155,12 @@ async def post_init(application: Application):
             logger.warning(f"Webhook URL reported by Telegram ({webhook_info.url}) differs from the URL we tried to set ({webhook_full_url}).")
     except Exception as e:
         logger.error(f"Error setting webhook: {e}", exc_info=True)
-
+        # Возвращаем None или райзим исключение, чтобы asyncio.run понял, что запуск не удался?
+        # Пока оставляем как есть, ошибка просто логируется.
+        # Но возможно, если set_webhook падает, run_webhook возвращает None?
+        # Это может объяснить ошибку "a coroutine was expected".
+        # Добавим явный raise, чтобы увидеть, если ошибка вебхука - причина.
+        # raise e # Раскомментируй, если хочешь, чтобы ошибка вебхука роняла старт
 
 # --- Основная точка входа ---
 if __name__ == "__main__":
@@ -169,19 +173,35 @@ if __name__ == "__main__":
         .build()
     )
 
-    # --- Регистрация ОДНОГО обработчика с МАКСИМАЛЬНО ШИРОКИМ фильтром ---
-    # Ловим ВСЕ типы обновлений (сообщения, коллбэки, что угодно), не являющиеся командами
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    # --- ИЗМЕНЕНО: Добавляем универсальный логгер ПЕРВЫМ ---
+    # group=-1 означает, что этот обработчик запустится раньше других
+    application.add_handler(TypeHandler(Update, log_all_updates), group=-1)
+
+    # Оставляем старый обработчик, но ожидаем, что он не сработает
+    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_message))
 
     logger.info("Application built. Starting webhook listener...")
     try:
-        webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-        asyncio.run(application.run_webhook(
+        # --- Убедимся, что post_init не вернул None или не вызвал исключение ---
+        # (Хотя post_init не должен ничего возвращать)
+        # Эта проверка избыточна, но для отладки оставим мысль:
+        # если бы post_init мог вернуть что-то, что помешало бы run_webhook...
+        logger.info("Running application.run_webhook...")
+        webhook_runner = application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=BOT_TOKEN,
-            webhook_url=webhook_full_url
-        ))
+            webhook_url=webhook_full_url # Передаем URL явно
+        )
+        # Логируем, что вернул run_webhook перед передачей в asyncio.run
+        logger.info(f"application.run_webhook returned: {type(webhook_runner)}")
+
+        # Запускаем основную корутину
+        asyncio.run(webhook_runner)
+
+    except ValueError as e:
+        # Ловим конкретно ошибку ValueError, чтобы увидеть сообщение
+        logger.critical(f"CRITICAL ERROR during asyncio.run: {e}", exc_info=True)
     except Exception as e:
          logger.critical(f"CRITICAL ERROR: Webhook server failed to start or run: {e}", exc_info=True)
     finally:
