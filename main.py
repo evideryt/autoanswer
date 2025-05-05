@@ -2,7 +2,8 @@ import logging
 import os
 import asyncio
 import json
-from datetime import datetime, timezone # Оставляем для работы с datetime
+import httpx # <--- Добавляем для HTTP запросов
+from datetime import datetime, timezone
 from collections import deque
 
 from telegram import Update
@@ -20,80 +21,151 @@ from telegram.error import TelegramError
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING) # Управляем логами httpx
 logger = logging.getLogger(__name__)
 
+# --- Переменные окружения ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443))
 MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
+# --- Новые переменные для Qwen ---
+QWEN_API_KEY = os.environ.get("QWEN_API_KEY")
+QWEN_API_ENDPOINT = os.environ.get("QWEN_API_ENDPOINT") # URL для text generation
+
 HISTORY_SIZE = 5
 DEBOUNCE_DELAY = 15
+MY_NAME_IN_HISTORY = "киткат" # Как называть себя в истории для Qwen
 
+# --- Проверки переменных ---
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
 if not MY_TELEGRAM_ID_STR: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); exit()
+if not QWEN_API_KEY: logger.critical("CRITICAL: Missing QWEN_API_KEY"); exit() # <--- Проверка QWEN_API_KEY
+if not QWEN_API_ENDPOINT: logger.critical("CRITICAL: Missing QWEN_API_ENDPOINT"); exit() # <--- Проверка QWEN_API_ENDPOINT
 try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
 except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID is not valid int"); exit()
 
 logger.info(f"BOT_TOKEN loaded: YES")
 logger.info(f"WEBHOOK_URL loaded: {WEBHOOK_URL}")
 logger.info(f"PORT configured: {PORT}")
-logger.info(f"MY_TELEGRAM_ID (forward target) loaded: {MY_TELEGRAM_ID}")
+logger.info(f"MY_TELEGRAM_ID loaded: {MY_TELEGRAM_ID}")
+logger.info(f"QWEN_API_KEY loaded: YES")
+logger.info(f"QWEN_API_ENDPOINT loaded: {QWEN_API_ENDPOINT}")
 logger.info(f"History size: {HISTORY_SIZE}, Debounce delay: {DEBOUNCE_DELAY}s")
 
 # --- Хранилища в памяти ---
-# {chat_id: deque([(sender_name, datetime_obj, text), ...], maxlen=HISTORY_SIZE)} # Теперь храним datetime
+# {chat_id: deque([(sender_name, datetime_obj, text), ...], maxlen=HISTORY_SIZE)}
 chat_histories = {}
 # {chat_id: asyncio.Task}
 debounce_timers = {}
 
-# --- УБРАЛИ функцию format_timestamp ---
+# --- Функция для взаимодействия с Qwen API ---
+async def get_qwen_response(history: deque) -> str | None:
+    """Отправляет историю в Qwen API и возвращает ответ."""
+    logger.info(f"Requesting Qwen response for history (size {len(history)})")
 
-# --- Отложенная задача отправки истории ---
-async def send_history_to_owner(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Форматирует и отправляет историю чата владельцу."""
-    logger.info(f"Debounce timer expired for chat {chat_id}. Preparing to send history.")
+    # --- Форматируем историю для Qwen ---
+    # (Предполагаем формат [{"role": "user/assistant", "content": "text"}, ...])
+    # Точный формат нужно будет сверить с документацией Qwen!
+    messages_for_qwen = []
+    for sender_name, _, text in history:
+        role = "assistant" if sender_name == MY_NAME_IN_HISTORY else "user"
+        messages_for_qwen.append({"role": role, "content": text})
+
+    # --- Тело запроса к Qwen API ---
+    # Точная структура зависит от API Qwen (модель, параметры и т.д.)
+    # Это пример, возможно, потребует адаптации!
+    payload = {
+        "model": "qwen-turbo", # Или другая модель, доступная по твоему API
+        "input": {
+            "messages": messages_for_qwen
+        },
+        "parameters": {
+            # Можно добавить параметры, например, ограничение длины ответа
+             "max_tokens": 150
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {QWEN_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client: # Увеличим таймаут
+            response = await client.post(QWEN_API_ENDPOINT, json=payload, headers=headers)
+            response.raise_for_status() # Проверка на HTTP ошибки (4xx, 5xx)
+
+            result = response.json()
+            logger.debug(f"Qwen API Raw Response: {json.dumps(result, indent=2)}")
+
+            # --- Извлекаем ответ ---
+            # Точный путь к тексту ответа зависит от структуры ответа Qwen API!
+            # Это лишь предположение!
+            generated_text = result.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content")
+
+            if generated_text:
+                logger.info(f"Received Qwen response: '{generated_text[:50]}...'")
+                return generated_text.strip()
+            else:
+                logger.error(f"Qwen API response does not contain expected text field. Response: {result}")
+                return None
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Qwen API request failed with status {e.response.status_code}: {e.response.text}")
+        return None
+    except httpx.RequestError as e:
+        logger.error(f"Qwen API request failed: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error processing Qwen API response: {e}", exc_info=True)
+        return None
+
+
+# --- Новая отложенная задача: Запрос к Qwen и ответ в чат ---
+async def trigger_qwen_response(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Получает ответ от Qwen и отправляет его в оригинальный чат."""
+    logger.info(f"Debounce timer expired for chat {chat_id}. Triggering Qwen response.")
     if chat_id not in chat_histories:
-        logger.warning(f"History not found for chat {chat_id} when timer expired.")
+        logger.warning(f"History not found for chat {chat_id} when Qwen trigger expired.")
         return
 
     history = chat_histories[chat_id]
     if not history:
-        logger.info(f"History for chat {chat_id} is empty. Nothing to send.")
+        logger.info(f"History for chat {chat_id} is empty. Nothing to send to Qwen.")
         return
 
-    formatted_history = [f"История чата (ID: {chat_id}):"]
-    # --- ИЗМЕНЕНИЕ: Работаем напрямую с объектом datetime ---
-    for sender_name, dt_obj, text in history: # Переименовали timestamp в dt_obj
-        if isinstance(dt_obj, datetime):
-            # Форматируем напрямую datetime объект
-            time_str = dt_obj.strftime("%d.%m.%Y %H:%M:%S UTC")
-        else:
-            logger.warning(f"History for chat {chat_id} contains non-datetime object: {dt_obj}. Skipping formatting.")
-            time_str = "[invalid date]"
+    # Получаем ответ от Qwen
+    qwen_response = await get_qwen_response(history)
 
-        # Экранирование HTML
-        safe_sender = sender_name.replace("<", "<").replace(">", ">").replace("&", "&")
-        safe_text = text.replace("<", "<").replace(">", ">").replace("&", "&")
-        formatted_history.append(f"<b>{safe_sender}</b> [{time_str}]:\n{safe_text}")
-        # -------------------------------------------------------
+    if qwen_response:
+        # Отправляем ответ в ОРИГИНАЛЬНЫЙ чат
+        try:
+            sent_message = await context.bot.send_message(
+                chat_id=chat_id, # <--- Отправляем в оригинальный chat_id
+                text=qwen_response,
+                # parse_mode=None # Лучше без parse_mode для ответов ИИ
+            )
+            logger.info(f"Successfully sent Qwen response to chat {chat_id}.")
 
-    final_text = "\n\n".join(formatted_history)
+            # --- Добавляем ответ бота в историю ---
+            # Используем текущее время, т.к. у sent_message может не быть message.date
+            response_timestamp = datetime.now(timezone.utc)
+            if chat_id in chat_histories: # Убедимся, что история еще существует
+                chat_histories[chat_id].append((MY_NAME_IN_HISTORY, response_timestamp, qwen_response))
+                logger.debug(f"Added bot's response to history for chat {chat_id}. History size: {len(chat_histories[chat_id])}")
+            # ------------------------------------
 
-    try:
-        await context.bot.send_message(
-            chat_id=MY_TELEGRAM_ID,
-            text=final_text,
-            parse_mode='HTML'
-        )
-        logger.info(f"Successfully sent history for chat {chat_id} to owner {MY_TELEGRAM_ID}.")
-    except TelegramError as e:
-        logger.error(f"Failed to send history for chat {chat_id} to owner {MY_TELEGRAM_ID}: {e}")
-    finally:
-        if chat_id in debounce_timers:
-            del debounce_timers[chat_id]
+        except TelegramError as e:
+            logger.error(f"Failed to send Qwen response to chat {chat_id}: {e}")
+    else:
+        logger.error(f"Did not receive a valid response from Qwen for chat {chat_id}.")
+
+    # Удаляем таймер из словаря после выполнения
+    if chat_id in debounce_timers:
+        del debounce_timers[chat_id]
 
 
 # --- Обработчик бизнес-сообщений ---
@@ -103,51 +175,46 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
 
     chat_id = message.chat.id
     sender = message.from_user
-    # --- ИЗМЕНЕНИЕ: Сохраняем datetime объект ---
-    timestamp_dt = message.date # Это уже datetime объект
-    # -----------------------------------------
+    timestamp_dt = message.date
     text = message.text or "[нетекстовое сообщение]"
 
     if not sender:
-        logger.warning(f"Received business_message without sender info in chat {chat_id}. Update: {update.to_json()}")
+        logger.warning(f"Received business_message without sender info in chat {chat_id}.")
         return
 
     sender_id = sender.id
-    sender_name = sender.first_name or f"ID:{sender_id}"
+    # Определяем имя для истории
+    sender_name = MY_NAME_IN_HISTORY if sender_id == MY_TELEGRAM_ID else (sender.first_name or f"ID:{sender_id}")
 
     logger.info(f"Received business message from {sender_name}({sender_id}) in chat {chat_id}")
 
     # Добавляем сообщение в историю
     if chat_id not in chat_histories:
         chat_histories[chat_id] = deque(maxlen=HISTORY_SIZE)
-
-    # --- ИЗМЕНЕНИЕ: Сохраняем datetime объект ---
     chat_histories[chat_id].append((sender_name, timestamp_dt, text))
-    # -----------------------------------------
     logger.debug(f"Added message to history for chat {chat_id}. History size: {len(chat_histories[chat_id])}")
 
-    # Логика задержки (Debounce)
+    # --- Логика задержки (Debounce) ---
+    # Запускаем таймер только если сообщение НЕ от владельца бота
     if sender_id != MY_TELEGRAM_ID:
         if chat_id in debounce_timers:
             debounce_timers[chat_id].cancel()
             logger.debug(f"Cancelled previous debounce timer for chat {chat_id}")
 
         logger.debug(f"Starting new {DEBOUNCE_DELAY}s debounce timer for chat {chat_id}")
-        # Используем context.job_queue.run_once для более надежного таймера
-        # (Но для простоты оставим asyncio.create_task, он должен работать)
         new_timer = asyncio.create_task(
             asyncio.sleep(DEBOUNCE_DELAY, result=chat_id)
         )
+        # --- ИЗМЕНЕНИЕ: Вызываем trigger_qwen_response ---
         new_timer.add_done_callback(
-            # Используем лямбду, чтобы передать context в callback
-            lambda task: asyncio.create_task(send_history_to_owner(task.result(), context)) if not task.cancelled() else None
+            lambda task: asyncio.create_task(trigger_qwen_response(task.result(), context)) if not task.cancelled() else None
         )
         debounce_timers[chat_id] = new_timer
     else:
-        logger.debug(f"Message from owner ({sender_id}). History updated, debounce timer not started/reset.")
+        logger.debug(f"Message from owner ({MY_NAME_IN_HISTORY}). History updated, debounce timer not started/reset.")
 
 
-# --- Обработчик для логирования (без изменений) ---
+# --- Обработчик для логирования (оставляем для отладки) ---
 async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"--- Received Raw Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}")
 
@@ -171,17 +238,21 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-# --- Основная точка входа (без изменений) ---
+# --- Основная точка входа ---
 if __name__ == "__main__":
-    logger.info("Initializing Telegram Business Debounce Bot...")
+    logger.info("Initializing Qwen Autoresponder Bot...") # Новое имя
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
+
+    # --- Регистрация обработчиков ---
     application.add_handler(TypeHandler(Update, log_all_updates), group=-1)
     application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message))
+
     logger.info("Application built. Starting webhook listener...")
     try:
         webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
@@ -194,6 +265,7 @@ if __name__ == "__main__":
         )
         logger.info(f"application.run_webhook returned: {type(webhook_runner)}")
         asyncio.run(webhook_runner)
+
     except ValueError as e:
         logger.critical(f"CRITICAL ERROR during asyncio.run: {e}", exc_info=True)
     except Exception as e:
