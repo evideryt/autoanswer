@@ -1,3 +1,4 @@
+# ... (все импорты и настройки до handle_business_update остаются без изменений) ...
 import logging
 import os
 import asyncio
@@ -10,45 +11,25 @@ import time # Для паузы между сообщениями
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
-    MessageHandler,
-    filters,
+    MessageHandler, # Используем для бизнес-сообщений
+    filters,        # Используем фильтры UpdateType
     ContextTypes,
-    CallbackQueryHandler,
+    CallbackQueryHandler, # Для обработки кнопок
 )
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
 # --- Настройки и переменные (без изменений) ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("google.generativeai").setLevel(logging.INFO)
+# ... (код переменных) ...
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-PORT = int(os.environ.get("PORT", 8443))
-MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-CONFIG_FILE = "adp.txt"
-
-MAX_HISTORY_PER_CHAT = 30
-DEBOUNCE_DELAY = 15
-MY_NAME_FOR_HISTORY = "киткат"
-MESSAGE_SPLIT_DELAY = 0.7
-
-BASE_SYSTEM_PROMPT = ""
-MY_CHARACTER_DESCRIPTION = ""
-CHAR_DESCRIPTIONS = {}
-
-chat_histories = {}
-debounce_tasks = {}
-pending_replies = {}
-gemini_model = None
-MY_TELEGRAM_ID = None # Инициализируем как None
-
-# --- КРИТИЧЕСКИЕ ПРОВЕРКИ ПЕРЕМЕННЫХ ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN"); WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
+MAX_HISTORY_PER_CHAT = 30; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
+BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; CHAR_DESCRIPTIONS = {}
+chat_histories = {}; debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
@@ -58,9 +39,9 @@ except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_
 if not GEMINI_API_KEY: logger.critical("CRITICAL: Missing GEMINI_API_KEY"); exit()
 
 # --- Функция парсинга конфигурационного файла (без изменений) ---
+# ... (код parse_config_file) ...
 def parse_config_file(filepath: str):
-    global BASE_SYSTEM_PROMPT, MY_CHARACTER_DESCRIPTION, CHAR_DESCRIPTIONS
-    logger.info(f"Attempting to parse config file: {filepath}")
+    global BASE_SYSTEM_PROMPT, MY_CHARACTER_DESCRIPTION, CHAR_DESCRIPTIONS; logger.info(f"Attempting to parse config file: {filepath}")
     try:
         with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
         sections = {}; current_section_name = None; current_section_content = []
@@ -71,9 +52,7 @@ def parse_config_file(filepath: str):
                 current_section_name = stripped_line[2:]; current_section_content = []
             elif current_section_name is not None: current_section_content.append(line)
         if current_section_name: sections[current_section_name] = "\n".join(current_section_content).strip()
-        BASE_SYSTEM_PROMPT = sections.get("SYSTEM_PROMPT", "").strip()
-        MY_CHARACTER_DESCRIPTION = sections.get("MC", "").strip()
-        CHAR_DESCRIPTIONS = {}
+        BASE_SYSTEM_PROMPT = sections.get("SYSTEM_PROMPT", "").strip(); MY_CHARACTER_DESCRIPTION = sections.get("MC", "").strip(); CHAR_DESCRIPTIONS = {}
         chars_content = sections.get("CHARS", "")
         if chars_content:
             for char_line in chars_content.splitlines():
@@ -83,23 +62,19 @@ def parse_config_file(filepath: str):
                     else: logger.warning(f"Skipping invalid line in CHARS section: {char_line}")
         if not BASE_SYSTEM_PROMPT: logger.error(f"CRITICAL: '!!SYSTEM_PROMPT' not found or empty in {filepath}.")
         if not MY_CHARACTER_DESCRIPTION: logger.warning(f"'!!MC' not found or empty in {filepath}.")
-        logger.info(f"Config loaded from {filepath}:")
-        logger.info(f"  SYSTEM_PROMPT: {'Loaded' if BASE_SYSTEM_PROMPT else 'MISSING/EMPTY'}")
-        logger.info(f"  MY_CHARACTER_DESCRIPTION: {'Loaded' if MY_CHARACTER_DESCRIPTION else 'MISSING/EMPTY'}")
-        logger.info(f"  Loaded {len(CHAR_DESCRIPTIONS)} character descriptions.")
-        logger.debug(f"PARSED CHAR_DESCRIPTIONS: {CHAR_DESCRIPTIONS}")
+        logger.info(f"Config loaded from {filepath}:"); logger.info(f"  SYSTEM_PROMPT: {'Loaded' if BASE_SYSTEM_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  MY_CHARACTER_DESCRIPTION: {'Loaded' if MY_CHARACTER_DESCRIPTION else 'MISSING/EMPTY'}"); logger.info(f"  Loaded {len(CHAR_DESCRIPTIONS)} character descriptions."); logger.debug(f"PARSED CHAR_DESCRIPTIONS: {CHAR_DESCRIPTIONS}")
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
 
+
 # --- Функции истории и Gemini (без изменений) ---
+# ... (код update_chat_history, get_formatted_history, generate_gemini_response) ...
 def update_chat_history(chat_id: int, role: str, text: str):
     if not text or not text.strip(): logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping."); return
     if chat_id not in chat_histories: chat_histories[chat_id] = deque(maxlen=MAX_HISTORY_PER_CHAT)
     chat_histories[chat_id].append({"role": role, "parts": [{"text": text.strip()}]})
     logger.debug(f"Updated history for chat {chat_id}. Role: {role}. New length: {len(chat_histories[chat_id])}")
-
 def get_formatted_history(chat_id: int) -> list: return list(chat_histories.get(chat_id, []))
-
 async def generate_gemini_response(dynamic_context_parts: list, chat_history: list) -> str | None:
     global gemini_model; # ... (остальной код функции без изменений) ...
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
@@ -124,8 +99,8 @@ async def generate_gemini_response(dynamic_context_parts: list, chat_history: li
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
 # --- Функция обработки чата ПОСЛЕ задержки (без изменений) ---
+# ... (код process_chat_after_delay) ...
 async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код функции без изменений) ...
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
     current_history = get_formatted_history(chat_id); dynamic_prompt_parts = []
     logger.debug(f"Looking for description for sender_id_str: '{sender_id_str}' (type: {type(sender_id_str)})")
@@ -150,7 +125,6 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str
     else: logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
-
 # --- ИЗМЕНЕННЫЙ Основной обработчик бизнес-сообщений ---
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # logger.info(f"--- Received Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}")
@@ -162,6 +136,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     sender = message_to_process.from_user
     text = message_to_process.text
     message_id = message_to_process.message_id # ID сообщения для удаления
+    # business_connection_id получается из update.business_message, если есть
     business_connection_id = getattr(message_to_process, 'business_connection_id', None)
 
     if not text: logger.debug(f"Ignoring non-text business message in chat {chat.id}"); return
@@ -169,53 +144,41 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     chat_id = chat.id
     sender_id_str = str(sender.id) if sender else None
 
-    # --- НОВЫЙ БЛОК: Обработка команды /v от тебя ---
+    # --- Обработка команды /v от тебя ---
     if sender and sender.id == MY_TELEGRAM_ID and text.startswith("/v "):
-        transcription = text[3:].strip() # Извлекаем текст после "/v "
+        transcription = text[3:].strip()
         if transcription:
             logger.info(f"Detected voice transcription command in chat {chat_id}. Text: '{transcription[:30]}...'")
-            # Добавляем транскрипцию в историю КАК БУДТО ОТ СОБЕСЕДНИКА
             update_chat_history(chat_id, "user", transcription)
-            # Пытаемся удалить исходное /v сообщение
             try:
-                # Для удаления бизнес-сообщений нужен business_connection_id
-                if business_connection_id:
-                     # Метод delete_message ожидает chat_id и message_id
-                     # Но возможно, для бизнес сообщений нужен deleteBusinessMessages? Проверяем delete_message
-                     # await context.bot.delete_message(chat_id=chat_id, message_id=message_id) # Стандартный метод
-                     # Используем deleteBusinessMessages
-                     deleted = await context.bot.delete_business_messages(
-                          business_connection_id=business_connection_id,
-                          chat_id=chat_id,
-                          message_ids=[message_id]
-                     )
-                     if deleted:
-                          logger.info(f"Successfully deleted business message {message_id} in chat {chat_id} via ConnID {business_connection_id}")
-                     else:
-                          logger.warning(f"delete_business_messages for message {message_id} in chat {chat_id} returned False.")
+                # --- ПЫТАЕМСЯ УДАЛИТЬ через стандартный delete_message ---
+                # Для этого метода business_connection_id не нужен явно
+                # но бот должен иметь права на удаление сообщений В ЭТОМ ЧАТЕ (если это группа)
+                # или это должно быть его собственное сообщение (что не наш случай)
+                # Для бизнес-сообщений, отправленных пользователем (тобой), это может не сработать.
+                logger.info(f"Attempting to delete message {message_id} in chat {chat_id} using standard delete_message.")
+                deleted = await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                if deleted: # delete_message возвращает True при успехе
+                     logger.info(f"Successfully deleted message {message_id} in chat {chat_id} using standard delete_message.")
                 else:
-                     logger.warning(f"Cannot delete message {message_id} in chat {chat_id}: business_connection_id is missing.")
-
+                     # Этого не должно быть, т.к. delete_message обычно райзит ошибку при неудаче
+                     logger.warning(f"Standard delete_message for {message_id} in chat {chat_id} returned False (unexpected).")
             except Forbidden:
-                 logger.error(f"Failed to delete message {message_id} in chat {chat_id}: Bot lacks permission (Forbidden).")
+                 logger.error(f"Failed to delete message {message_id} in chat {chat_id} (standard delete_message): Bot lacks permission (Forbidden).")
             except BadRequest as e:
-                 logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e} (BadRequest). Maybe wrong API call or message too old?")
+                 # Например, "message to delete not found" или "message can't be deleted"
+                 logger.error(f"Failed to delete message {message_id} in chat {chat_id} (standard delete_message): {e} (BadRequest).")
             except Exception as e:
-                 logger.error(f"Unexpected error deleting message {message_id} in chat {chat_id}: {e}", exc_info=True)
-
-            # Важно: НЕ запускаем Gemini и дебаунс для этого сообщения
-            return # Прерываем дальнейшую обработку этого /v сообщения
+                 logger.error(f"Unexpected error deleting message {message_id} (standard delete_message) in chat {chat_id}: {e}", exc_info=True)
+            return
         else:
             logger.warning(f"Received empty /v command from {MY_TELEGRAM_ID} in chat {chat_id}. Ignoring.")
-            # Можно отправить уведомление об ошибке
-            # await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=f"Команда /v в чате {chat_id} была пустой.")
-            return # Тоже прерываем
+            return
 
-    # --- Остальная логика для обычных входящих/исходящих ---
+    # --- Остальная логика (без изменений) ---
+    # ... (код для is_outgoing и входящих сообщений) ...
     is_outgoing = sender and sender.id == MY_TELEGRAM_ID
-
     if is_outgoing:
-        # (Логика для исходящих без изменений)
         logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}")
         update_chat_history(chat_id, "model", text)
         if chat_id in debounce_tasks:
@@ -224,10 +187,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
              except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
              del debounce_tasks[chat_id]
         return
-
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
-
-    # (Логика для входящих без изменений)
     logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
     sender_name = sender.first_name or f"User_{sender_id_str}"
     update_chat_history(chat_id, "user", text)
@@ -246,7 +206,6 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     task = asyncio.create_task(delayed_processing())
     debounce_tasks[chat_id] = task
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
-
 
 # --- Обработчик нажатий на кнопку (без изменений) ---
 # ... (код button_handler) ...
@@ -300,22 +259,15 @@ async def post_init(application: Application):
     webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
     logger.info(f"Attempting to set webhook using: {webhook_full_url}")
     try:
-        await application.bot.set_webhook(
-            url=webhook_full_url,
-            allowed_updates=[ # Убедимся, что все нужные типы здесь
-                "message", "edited_message", "channel_post", "edited_channel_post",
+        await application.bot.set_webhook( url=webhook_full_url,
+            allowed_updates=[ "message", "edited_message", "channel_post", "edited_channel_post",
                 "business_connection", "business_message", "edited_business_message",
-                "deleted_business_messages", "my_chat_member", "chat_member",
-                "callback_query"
-             ],
-            drop_pending_updates=True
-        )
-        webhook_info = await application.bot.get_webhook_info()
-        logger.info(f"Webhook info after setting: {webhook_info}")
+                "deleted_business_messages", "my_chat_member", "chat_member", "callback_query"],
+            drop_pending_updates=True )
+        webhook_info = await application.bot.get_webhook_info(); logger.info(f"Webhook info after setting: {webhook_info}")
         if webhook_info.url == webhook_full_url: logger.info("Webhook successfully set!")
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}", exc_info=True)
+    except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
 
 # --- Основная точка входа (без изменений) ---
 # ... (код __main__) ...
@@ -327,18 +279,14 @@ if __name__ == "__main__":
         gemini_model = genai.GenerativeModel("gemini-1.5-pro", system_instruction=BASE_SYSTEM_PROMPT)
         logger.info(f"Gemini model '{gemini_model.model_name}' initialized successfully.")
     except Exception as e: logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
-
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_update))
     application.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, handle_business_update))
     application.add_handler(CallbackQueryHandler(button_handler))
-
     logger.info("Application built. Starting webhook listener...")
     try:
         webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-        asyncio.run(application.run_webhook(
-            listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=webhook_full_url
-        ))
+        asyncio.run(application.run_webhook(listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=webhook_full_url))
     except ValueError as e: logger.critical(f"CRITICAL ERROR asyncio.run: {e}", exc_info=True)
     except Exception as e: logger.critical(f"CRITICAL ERROR Webhook server: {e}", exc_info=True)
     finally: logger.info("Webhook server shut down.")
