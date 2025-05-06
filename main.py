@@ -276,7 +276,7 @@ if __name__ == "__main__":
     parse_config_file(CONFIG_FILE)
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-1.5-pro", system_instruction=BASE_SYSTEM_PROMPT)
+        gemini_model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=BASE_SYSTEM_PROMPT)
         logger.info(f"Gemini model '{gemini_model.model_name}' initialized successfully.")
     except Exception as e: logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
