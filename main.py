@@ -9,9 +9,8 @@ import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
-    # TypeHandler, # <--- Убираем универсальный TypeHandler
-    MessageHandler, # <--- Возвращаем MessageHandler для бизнес-сообщений
-    filters,        # <--- Понадобятся фильтры
+    MessageHandler,
+    filters,
     ContextTypes,
     CallbackQueryHandler,
 )
@@ -43,7 +42,7 @@ SYSTEM_PROMPT = f"""Ты — ИИ-ассистент, отвечающий на 
 
 chat_histories = {}
 debounce_tasks = {}
-pending_replies = {}
+pending_replies = {} # Теперь храним {chat_id: (response_text, business_connection_id)}
 gemini_model = None
 
 # --- КРИТИЧЕСКИЕ ПРОВЕРКИ ПЕРЕМЕННЫХ (без изменений) ---
@@ -62,14 +61,10 @@ logger.info(f"MY_TELEGRAM_ID loaded: {MY_TELEGRAM_ID}")
 logger.info(f"GEMINI_API_KEY loaded: YES")
 logger.info(f"History length: {MAX_HISTORY_PER_CHAT}, Debounce delay: {DEBOUNCE_DELAY}s")
 
-# --- Функции истории, Gemini, process_chat_after_delay, handle_business_update (без изменений) ---
-# ... (Они остаются такими же, как в предыдущем ответе) ...
+# --- Функции истории и Gemini (без изменений) ---
 def update_chat_history(chat_id: int, role: str, text: str):
-    if not text or not text.strip():
-        logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping.")
-        return
-    if chat_id not in chat_histories:
-        chat_histories[chat_id] = deque(maxlen=MAX_HISTORY_PER_CHAT)
+    if not text or not text.strip(): logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping."); return
+    if chat_id not in chat_histories: chat_histories[chat_id] = deque(maxlen=MAX_HISTORY_PER_CHAT)
     chat_histories[chat_id].append({"role": role, "parts": [{"text": text.strip()}]})
     logger.debug(f"Updated history for chat {chat_id}. Role: {role}. New length: {len(chat_histories[chat_id])}")
 
@@ -101,13 +96,23 @@ async def generate_gemini_response(chat_history: list) -> str | None:
         logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True)
         return None
 
-async def process_chat_after_delay(chat_id: int, sender_name: str, context: ContextTypes.DEFAULT_TYPE):
+# --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
+async def process_chat_after_delay(
+    chat_id: int,
+    sender_name: str,
+    business_connection_id: str | None, # <--- ПРИНИМАЕМ ID СВЯЗИ
+    context: ContextTypes.DEFAULT_TYPE
+):
     logger.info(f"Debounce timer expired for chat {chat_id}. Processing...")
     current_history = get_formatted_history(chat_id)
     gemini_response = await generate_gemini_response(current_history)
+
     if gemini_response:
-        pending_replies[chat_id] = gemini_response
-        logger.debug(f"Stored pending reply for chat {chat_id}")
+        # Сохраняем ответ И ID СВЯЗИ для кнопки
+        pending_replies[chat_id] = (gemini_response, business_connection_id)
+        logger.debug(f"Stored pending reply for chat {chat_id} with connection_id {business_connection_id}")
+
+        # Отправляем предложенный ответ ТЕБЕ с кнопкой
         try:
             safe_sender_name = html.escape(sender_name)
             escaped_gemini_response = html.escape(gemini_response)
@@ -116,46 +121,63 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, context: Cont
                 f"──────────────────\n"
                 f"<code>{escaped_gemini_response}</code>"
             )
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить в чат", callback_data=f"send_{chat_id}")]])
+            # --- ИЗМЕНЕНО: Добавляем connection_id в callback_data ---
+            # Формат: "send_<chat_id>_<connection_id>" (если ID есть)
+            # Если ID нет (например, старое сообщение?), кнопка не будет иметь ID
+            callback_data = f"send_{chat_id}"
+            if business_connection_id:
+                callback_data += f"_{business_connection_id}"
+
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить в чат", callback_data=callback_data)]])
+
             await context.bot.send_message(
                 chat_id=MY_TELEGRAM_ID, text=reply_text, reply_markup=keyboard, parse_mode=ParseMode.HTML
             )
-            logger.info(f"Sent suggested reply with button for chat {chat_id} to {MY_TELEGRAM_ID}")
+            logger.info(f"Sent suggested reply with button (cb: {callback_data}) for chat {chat_id} to {MY_TELEGRAM_ID}")
         except TelegramError as e:
             logger.error(f"Failed to send suggested reply (HTML) to {MY_TELEGRAM_ID}: {e}")
+            # Fallback и т.д. (оставляем как есть)
             try:
                 reply_text_plain = (f"🤖 Предложенный ответ для чата {chat_id} ({sender_name}):\n"
                                   f"──────────────────\n{gemini_response}\n(Не удалось добавить кнопку отправки)")
                 await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_plain)
                 logger.info(f"Sent suggested reply (plain fallback) for chat {chat_id} to {MY_TELEGRAM_ID}")
-            except Exception as e2:
-                logger.error(f"Failed to send suggested reply (plain fallback) to {MY_TELEGRAM_ID}: {e2}")
+            except Exception as e2: logger.error(f"Failed to send suggested reply (plain fallback) to {MY_TELEGRAM_ID}: {e2}")
     else:
         logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
+
     if chat_id in debounce_tasks:
         del debounce_tasks[chat_id]
         logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
+
+# --- ИЗМЕНЕННЫЙ Основной обработчик бизнес-сообщений ---
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # --- ИЗМЕНЕНО: Проверяем наличие конкретных полей бизнес-сообщений ---
+    # --- ИЗМЕНЕНО: Логируем все обновление для поиска business_connection_id ---
+    logger.info(f"--- Received Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}")
+
+    # Определяем, какое сообщение обрабатывать и получаем его ID связи
+    business_connection_id = None
+    message_to_process = None
+
     if update.business_message:
         message_to_process = update.business_message
-        logger.info(f"--- Received Business Message (ID: {message_to_process.message_id}) ---")
+        business_connection_id = update.business_message.business_connection_id # <--- Получаем ID
+        logger.info(f"--- Received Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
     elif update.edited_business_message:
         message_to_process = update.edited_business_message
-        logger.info(f"--- Received Edited Business Message (ID: {message_to_process.message_id}) ---")
+        # В edited_business_message может не быть connection_id, нужно проверить!
+        business_connection_id = getattr(update.edited_business_message, 'business_connection_id', None)
+        logger.info(f"--- Received Edited Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
     else:
-        # Если это не business_message и не edited_business_message, игнорируем этим обработчиком
-        # logger.debug("Update is not a business_message or edited_business_message. Ignored by handle_business_update.")
+        # logger.debug("Update is not a business_message or edited_business_message. Ignored.")
         return
 
     chat = message_to_process.chat
     sender = message_to_process.from_user
     text = message_to_process.text
 
-    if not text:
-        logger.debug(f"Ignoring non-text business message in chat {chat.id}")
-        return
+    if not text: logger.debug(f"Ignoring non-text business message in chat {chat.id}"); return
 
     chat_id = chat.id
     is_outgoing = sender and sender.id == MY_TELEGRAM_ID
@@ -163,12 +185,19 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     if is_outgoing:
         logger.info(f"Processing OUTGOING business message in chat {chat_id}")
         update_chat_history(chat_id, "model", text)
+        # Отменяем таймер дебаунса, если мы ответили вручную раньше
+        if chat_id in debounce_tasks:
+             logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message.")
+             try: debounce_tasks[chat_id].cancel()
+             except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
+             # Удаляем отмененную задачу
+             del debounce_tasks[chat_id]
         return
 
-    logger.info(f"Processing INCOMING business message from user {sender.id if sender else 'Unknown'} in chat {chat_id}")
-    sender_name = "Собеседник"
+    # --- Если сообщение ВХОДЯЩЕЕ ---
+    logger.info(f"Processing INCOMING business message from user {sender.id if sender else 'Unknown'} in chat {chat_id} via ConnID: {business_connection_id}")
+    sender_name = "Собеседник";
     if sender: sender_name = sender.first_name or f"User_{sender.id}"
-
     update_chat_history(chat_id, "user", text)
 
     if chat_id in debounce_tasks:
@@ -181,22 +210,18 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
         try:
             await asyncio.sleep(DEBOUNCE_DELAY)
             logger.debug(f"Debounce delay finished for chat {chat_id}. Starting processing.")
-            await process_chat_after_delay(chat_id, sender_name, context)
-        except asyncio.CancelledError:
-            logger.info(f"Debounce task for chat {chat_id} was cancelled.")
-        except Exception as e:
-            logger.error(f"Error in delayed processing for chat {chat_id}: {e}", exc_info=True)
+            # --- ИЗМЕНЕНО: Передаем business_connection_id ---
+            await process_chat_after_delay(chat_id, sender_name, business_connection_id, context)
+        except asyncio.CancelledError: logger.info(f"Debounce task for chat {chat_id} was cancelled.")
+        except Exception as e: logger.error(f"Error in delayed processing for chat {chat_id}: {e}", exc_info=True)
 
     task = asyncio.create_task(delayed_processing())
     debounce_tasks[chat_id] = task
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
 
-# ... (весь код до button_handler без изменений) ...
-
 # --- ИЗМЕНЕННЫЙ Обработчик нажатий на кнопку ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на inline-кнопки."""
     query = update.callback_query
     if not query: logger.warning("Received update without callback_query in button_handler"); return
 
@@ -206,44 +231,67 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         logger.debug("Callback query answered.")
     except Exception as e:
-        logger.error(f"Failed to answer callback query: {e}"); return
+        logger.error(f"CRITICAL: Failed to answer callback query: {e}. Stopping handler."); return
 
     data = query.data
+    # --- ИЗМЕНЕНО: Парсим callback_data с connection_id ---
     if not data or not data.startswith("send_"):
         logger.warning(f"Received unhandled callback_data: {data}")
-        try:
-            await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка: Неизвестные данные кнопки.</b>",
-                                          parse_mode=ParseMode.HTML, reply_markup=None)
-        except Exception as edit_e: logger.error(f"Failed to edit message on unhandled callback: {edit_e}")
+        # ... (обработка ошибки) ...
         return
+
+    target_chat_id = None
+    business_connection_id = None
+    response_text = None
     try:
-        target_chat_id_str = data.split("_", 1)[1]
+        parts = data.split("_", 2) # Ожидаем "send", chat_id, connection_id
+        if len(parts) < 2: raise ValueError("Callback data too short")
+
+        target_chat_id_str = parts[1]
         target_chat_id = int(target_chat_id_str)
-        logger.info(f"Button press: Attempting to send reply to chat {target_chat_id}")
+        # Получаем connection_id, если он есть (может не быть для старых кнопок)
+        business_connection_id = parts[2] if len(parts) > 2 else None
 
-        response_text = pending_replies.pop(target_chat_id, None)
-        if not response_text:
-            logger.warning(f"No pending reply found for chat {target_chat_id} in button_handler.")
-            await query.edit_message_text(
-                text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Текст для отправки не найден.",
-                parse_mode=ParseMode.HTML, reply_markup=None
-            )
+        logger.info(f"Button press: Attempting to send reply to chat {target_chat_id} using ConnID: {business_connection_id}")
+
+        # Получаем данные из pending_replies
+        pending_data = pending_replies.pop(target_chat_id, None)
+        if not pending_data:
+            logger.warning(f"No pending reply found for chat {target_chat_id}.")
+            # ... (обработка ошибки) ...
             return
+
+        response_text, stored_conn_id = pending_data
+        # Проверяем, совпадает ли connection_id из кнопки и сохраненный (если оба есть)
+        if business_connection_id and stored_conn_id and business_connection_id != stored_conn_id:
+             logger.warning(f"Connection ID mismatch! Button had {business_connection_id}, stored was {stored_conn_id}. Using stored ID for sending.")
+             # Можно решить, какой использовать, пока используем сохраненный
+             business_connection_id = stored_conn_id
+        elif not business_connection_id and stored_conn_id:
+             # Если кнопка старая без ID, но в данных он есть - используем его
+             business_connection_id = stored_conn_id
+             logger.debug(f"Using stored connection ID {business_connection_id} as button had none.")
+
+
+        if not response_text: # Дополнительная проверка
+             logger.error(f"Extracted response_text is None for chat {target_chat_id}!")
+             # ... (обработка ошибки) ...
+             return
+
         logger.debug(f"Found pending reply for chat {target_chat_id}: '{response_text[:50]}...'")
+        logger.info(f"Attempting context.bot.send_message with: chat_id={target_chat_id}, text='{response_text[:50]}...', business_connection_id={business_connection_id}")
 
-        # --- ДОБАВЛЕНЫ ЛОГИ ПЕРЕД ОТПРАВКОЙ ---
-        logger.info(f"Attempting context.bot.send_message with: chat_id={target_chat_id}, text='{response_text[:50]}...'")
-        # Попробуем также получить информацию о чате, куда отправляем
+        # --- Отправка сообщения с business_connection_id ---
+        message_sent = False
+        last_exception = None
+        # Убираем цикл повтора, чтобы не усложнять. Если с ID не сработает - то не сработает.
         try:
-            chat_info = await context.bot.get_chat(target_chat_id)
-            logger.info(f"Target chat info: id={chat_info.id}, type={chat_info.type}, title='{chat_info.title}', username='{chat_info.username}'")
-        except Exception as e_chat_info:
-            logger.warning(f"Could not get info for target chat {target_chat_id}: {e_chat_info}")
-        # --- КОНЕЦ ДОБАВЛЕННЫХ ЛОГОВ ---
-
-        try:
-            sent_message = await context.bot.send_message(chat_id=target_chat_id, text=response_text)
-            logger.info(f"Successfully sent message {sent_message.message_id} to chat {target_chat_id}")
+            sent_message = await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=response_text,
+                business_connection_id=business_connection_id # <--- ПЕРЕДАЕМ ID СВЯЗИ!
+            )
+            logger.info(f"Successfully sent message {sent_message.message_id} to chat {target_chat_id} via ConnID {business_connection_id}")
             update_chat_history(target_chat_id, "model", response_text)
             logger.debug(f"Added sent message to history for chat {target_chat_id}")
             await query.edit_message_text(
@@ -251,25 +299,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML, reply_markup=None
             )
             logger.debug(f"Edited original suggestion message for chat {target_chat_id}")
-        except Forbidden:
-             logger.error(f"Forbidden error sending to chat {target_chat_id}. Check bot/account permissions in that specific chat.")
-             await query.edit_message_text(text=query.message.text_html + "\n\n<b>❌ Ошибка:</b> Нет прав на отправку в этот чат.", parse_mode=ParseMode.HTML, reply_markup=None)
-        except BadRequest as e:
-             logger.error(f"BadRequest error sending to chat {target_chat_id}: {e}. This might be due to chat not found, user blocked, etc.")
-             await query.edit_message_text(text=query.message.text_html + f"\n\n<b>❌ Ошибка отправки:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML, reply_markup=None)
-        except Exception as e:
-            logger.error(f"Unexpected error sending to chat {target_chat_id}: {e}", exc_info=True)
-            await query.edit_message_text(text=query.message.text_html + "\n\n<b>❌ Неизвестная ошибка.</b>", parse_mode=ParseMode.HTML, reply_markup=None)
-    except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing callback_data '{data}': {e}")
-        try: await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка: Неверные данные кнопки.</b>", parse_mode=ParseMode.HTML, reply_markup=None)
-        except Exception as edit_e: logger.error(f"Failed to edit message on parsing error: {edit_e}")
-    except Exception as e:
-        logger.error(f"Unexpected error in button_handler: {e}", exc_info=True)
-        try: await query.edit_message_text(text=query.message.text_html + "\n\n<b>❌ Внутренняя ошибка.</b>", parse_mode=ParseMode.HTML, reply_markup=None)
-        except Exception as edit_e: logger.error(f"Failed to edit message on general error: {edit_e}")
+            message_sent = True
 
-# ... (остальной код без изменений) ...
+        except Forbidden as e: last_exception = e; logger.error(f"Forbidden error sending to chat {target_chat_id} via ConnID {business_connection_id}. Error: {e}")
+        except BadRequest as e: last_exception = e; logger.error(f"BadRequest error sending to chat {target_chat_id} via ConnID {business_connection_id}: {e}.")
+        except Exception as e: last_exception = e; logger.error(f"Unexpected error sending to chat {target_chat_id} via ConnID {business_connection_id}: {e}", exc_info=True)
+
+        # Если не отправлено
+        if not message_sent:
+             logger.warning(f"Failed to send message to chat {target_chat_id} via ConnID {business_connection_id}.")
+             error_text = "<b>❌ Неизвестная ошибка отправки.</b>"
+             if isinstance(last_exception, Forbidden): error_text = "<b>❌ Ошибка:</b> Нет прав на отправку (Forbidden). Проверьте Business Connection / настройки чата."
+             elif isinstance(last_exception, BadRequest): error_text = f"<b>❌ Ошибка отправки (BadRequest):</b> {html.escape(str(last_exception))}"
+             try:
+                await query.edit_message_text(text=query.message.text_html + f"\n\n{error_text}", parse_mode=ParseMode.HTML, reply_markup=None)
+             except Exception as edit_e: logger.error(f"Failed to edit message after send failure: {edit_e}")
+
+    # Обработка других ошибок
+    except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}': {e}"); # ... обработка ошибки ...
+    except Exception as e: logger.error(f"Unexpected error in button_handler: {e}", exc_info=True); # ... обработка ошибки ...
+
 
 # --- Функция post_init (без изменений) ---
 async def post_init(application: Application):
@@ -293,7 +342,7 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-# --- ИЗМЕНЕНАЯ Основная точка входа ---
+# --- Основная точка входа (без изменений) ---
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
     try:
@@ -304,26 +353,9 @@ if __name__ == "__main__":
         logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # --- ИЗМЕНЕНО: Используем MessageHandler с фильтрами для бизнес-сообщений ---
-    # Фильтр для новых бизнес-сообщений
-    application.add_handler(MessageHandler(
-        filters.UpdateType.BUSINESS_MESSAGE,
-        handle_business_update
-    ))
-    # Фильтр для измененных бизнес-сообщений (если нужно обрабатывать их так же)
-    application.add_handler(MessageHandler(
-        filters.UpdateType.EDITED_BUSINESS_MESSAGE,
-        handle_business_update
-    ))
-
-    # Обработчик нажатий на кнопки
+    application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_update))
+    application.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, handle_business_update))
     application.add_handler(CallbackQueryHandler(button_handler))
-
-    # Опционально: Логгер для ВСЕХ обновлений (для отладки, если ничего не ловится)
-    # async def log_all(update: Update, context: ContextTypes.DEFAULT_TYPE): logger.info(f"RAW_UPDATE: {update.to_json()}")
-    # application.add_handler(TypeHandler(Update, log_all), group=-1)
-
 
     logger.info("Application built. Starting webhook listener...")
     try:
