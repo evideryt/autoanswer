@@ -39,7 +39,7 @@ MY_NAME_FOR_HISTORY = "киткат" # Это имя будет использо
 # --- Глобальные переменные для конфигурации из файла ---
 BASE_SYSTEM_PROMPT = ""
 MY_CHARACTER_DESCRIPTION = ""
- rozm_CHAR_DESCRIPTIONS = {} # Словарь: {str(user_id): "описание"}
+CHAR_DESCRIPTIONS = {} # Словарь: {str(user_id): "описание"}
 
 chat_histories = {}
 debounce_tasks = {}
