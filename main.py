@@ -134,60 +134,46 @@ def get_formatted_history(chat_id: int) -> list:
 
 
 # --- ИЗМЕНЕННАЯ Функция для вызова Gemini API ---
-async def generate_gemini_response(full_prompt_parts: list, chat_history: list) -> str | None:
+async def generate_gemini_response(dynamic_context_parts: list, chat_history: list) -> str | None:
     """
-    Отправляет в Gemini СНАЧАЛА full_prompt_parts (системный, описание киткат, описание собеседника),
+    Отправляет в Gemini СНАЧАЛА dynamic_context_parts (описание Китката, описание собеседника),
     а ПОТОМ chat_history.
+    Системный промпт (BASE_SYSTEM_PROMPT) уже установлен при инициализации модели.
     """
     global gemini_model
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
 
-    # Собираем полный контент для Gemini
-    # Gemini ожидает, что история будет чередоваться user/model.
-    # Системные инструкции и описания персонажей можно передать как первые 'user' или 'model' сообщения,
-    # или использовать поле system_instruction, если API модели его поддерживает для динамических промптов.
-    # Для простоты и совместимости с моделями, которые могут не иметь system_instruction в generate_content,
-    # добавим их как часть основного контента.
-    # Важно: Gemini ожидает, что после "user" всегда идет "model" (кроме последнего "user").
-    # Наш BASE_SYSTEM_PROMPT и описания персонажей лучше всего передать как "system instruction"
-    # или как первое сообщение от "user", если API это позволяет.
-    # В текущей библиотеке `google-generativeai` system_instruction задается при создании модели.
-    # Если мы хотим динамически менять системный промпт, его нужно вставлять в начало `contents`.
-    # Модели Gemini обычно хорошо работают, если системные указания даны один раз.
-    # Мы инициализируем модель с `SYSTEM_PROMPT` из файла.
-    # Описания персонажей можно добавить в начало истории.
-
-    # Формируем контент для Gemini:
-    # 1. Описание Китката (если есть)
-    # 2. Описание Собеседника (если есть)
-    # 3. История чата
-    # Системный промпт (BASE_SYSTEM_PROMPT) уже установлен при инициализации модели.
-    # Динамические части (описание "меня" и собеседника) добавим в начало истории.
-
     gemini_contents = []
+
+    # 1. Формируем единый блок контекстной информации
+    context_block_text = ""
     if MY_CHARACTER_DESCRIPTION:
-        # Представим это как контекст, который "модель" (киткат) знает о себе
-        gemini_contents.append({"role": "model", "parts": [{"text": f"Обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}"}]})
+        context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
 
-    # `full_prompt_parts` теперь содержит описание собеседника, если есть
-    # Добавляем его как дополнительный контекст. Gemini может сам разобраться, как его использовать.
-    for part in full_prompt_parts: # Это будет описание собеседника
-         gemini_contents.append({"role": "user", "parts": [{"text": part}]}) # "user" так как это инфо для модели
+    # `dynamic_context_parts` содержит описание собеседника, если есть
+    for part in dynamic_context_parts: # Это будет описание собеседника
+         context_block_text += f"{part}\n\n" # Добавляем описание собеседника
 
-    # Добавляем основную историю чата
-    gemini_contents.extend(chat_history)
+    # Добавляем этот блок как первое сообщение от "model" (мысли Китката)
+    # только если блок не пустой.
+    if context_block_text.strip():
+        gemini_contents.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
+        logger.debug(f"Prepended context block to Gemini contents.")
 
-    if not gemini_contents:
-        logger.warning("Cannot generate response for empty Gemini contents (no history and no descriptions).")
+    # 2. Добавляем основную историю чата
+    # Убедимся, что история не пуста, если контекстный блок тоже пуст
+    if not gemini_contents and not chat_history:
+        logger.warning("Cannot generate response for empty Gemini contents (no history and no context block).")
         return None
 
+    gemini_contents.extend(chat_history)
+
     logger.info(f"Sending request to Gemini with {len(gemini_contents)} content entries.")
-    # logger.debug(f"Full Gemini Payload (contents): {json.dumps(gemini_contents, ensure_ascii=False, indent=2)}") # Для отладки
+    # logger.debug(f"Full Gemini Payload (contents): {json.dumps(gemini_contents, ensure_ascii=False, indent=2)}")
 
     try:
-        # Используем gemini_model, который уже инициализирован с BASE_SYSTEM_PROMPT
         response = await gemini_model.generate_content_async(
-            contents=gemini_contents, # <--- Передаем сюда собранный контент
+            contents=gemini_contents,
             generation_config=genai.types.GenerationConfig(temperature=0.7),
             safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HARM_CATEGORY_HATE_SPEECH': 'block_none',
                              'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'}
@@ -204,6 +190,10 @@ async def generate_gemini_response(full_prompt_parts: list, chat_history: list) 
     except Exception as e:
         logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True)
         return None
+
+# `process_chat_after_delay` будет вызывать generate_gemini_response как и раньше,
+# передавая `dynamic_prompt_parts` (которые содержат описание собеседника)
+# и `current_history`.
 
 
 # --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
