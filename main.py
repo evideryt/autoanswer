@@ -192,8 +192,11 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
 
-# --- Обработчик нажатий на кнопку (без изменений) ---
+# ... (весь код до button_handler без изменений) ...
+
+# --- ИЗМЕНЕННЫЙ Обработчик нажатий на кнопку ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия на inline-кнопки."""
     query = update.callback_query
     if not query: logger.warning("Received update without callback_query in button_handler"); return
 
@@ -217,6 +220,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_chat_id_str = data.split("_", 1)[1]
         target_chat_id = int(target_chat_id_str)
         logger.info(f"Button press: Attempting to send reply to chat {target_chat_id}")
+
         response_text = pending_replies.pop(target_chat_id, None)
         if not response_text:
             logger.warning(f"No pending reply found for chat {target_chat_id} in button_handler.")
@@ -226,6 +230,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         logger.debug(f"Found pending reply for chat {target_chat_id}: '{response_text[:50]}...'")
+
+        # --- ДОБАВЛЕНЫ ЛОГИ ПЕРЕД ОТПРАВКОЙ ---
+        logger.info(f"Attempting context.bot.send_message with: chat_id={target_chat_id}, text='{response_text[:50]}...'")
+        # Попробуем также получить информацию о чате, куда отправляем
+        try:
+            chat_info = await context.bot.get_chat(target_chat_id)
+            logger.info(f"Target chat info: id={chat_info.id}, type={chat_info.type}, title='{chat_info.title}', username='{chat_info.username}'")
+        except Exception as e_chat_info:
+            logger.warning(f"Could not get info for target chat {target_chat_id}: {e_chat_info}")
+        # --- КОНЕЦ ДОБАВЛЕННЫХ ЛОГОВ ---
+
         try:
             sent_message = await context.bot.send_message(chat_id=target_chat_id, text=response_text)
             logger.info(f"Successfully sent message {sent_message.message_id} to chat {target_chat_id}")
@@ -237,10 +252,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             logger.debug(f"Edited original suggestion message for chat {target_chat_id}")
         except Forbidden:
-             logger.error(f"Failed to send to chat {target_chat_id}: Bot blocked or no permission.")
-             await query.edit_message_text(text=query.message.text_html + "\n\n<b>❌ Ошибка:</b> Нет прав на отправку.", parse_mode=ParseMode.HTML, reply_markup=None)
+             logger.error(f"Forbidden error sending to chat {target_chat_id}. Check bot/account permissions in that specific chat.")
+             await query.edit_message_text(text=query.message.text_html + "\n\n<b>❌ Ошибка:</b> Нет прав на отправку в этот чат.", parse_mode=ParseMode.HTML, reply_markup=None)
         except BadRequest as e:
-             logger.error(f"Failed to send to chat {target_chat_id}: {e}")
+             logger.error(f"BadRequest error sending to chat {target_chat_id}: {e}. This might be due to chat not found, user blocked, etc.")
              await query.edit_message_text(text=query.message.text_html + f"\n\n<b>❌ Ошибка отправки:</b> {html.escape(str(e))}", parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception as e:
             logger.error(f"Unexpected error sending to chat {target_chat_id}: {e}", exc_info=True)
@@ -253,6 +268,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Unexpected error in button_handler: {e}", exc_info=True)
         try: await query.edit_message_text(text=query.message.text_html + "\n\n<b>❌ Внутренняя ошибка.</b>", parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception as edit_e: logger.error(f"Failed to edit message on general error: {edit_e}")
+
+# ... (остальной код без изменений) ...
 
 # --- Функция post_init (без изменений) ---
 async def post_init(application: Application):
