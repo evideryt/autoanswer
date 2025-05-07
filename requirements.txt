@@ -2,3 +2,4 @@ python-telegram-bot[webhooks]==21.1.1
 requests
 httpx
 google-generativeai
+psycopg

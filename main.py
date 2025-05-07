@@ -2,11 +2,13 @@ import logging
 import os
 import asyncio
 import json
-from collections import deque
+from collections import deque # Больше не нужен для основной истории, но оставим для возможного использования
 import google.generativeai as genai
 import html
 import time
-import uuid # <--- ДОБАВЛЕНО: Для генерации уникальных ID
+import uuid
+import psycopg # <--- ДОБАВЛЕНО: для PostgreSQL
+from datetime import datetime # <--- ДОБАВЛЕНО: для временных меток
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -20,20 +22,20 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
 # --- Настройки и переменные (без изменений) ---
-# ... (код переменных) ...
+# ... (все переменные остаются) ...
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
+logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING) # Уменьшаем логи psycopg
 logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN"); WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
+DATABASE_URL = os.environ.get("DATABASE_URL") # <--- Убедимся, что читаем URL базы
 MAX_HISTORY_PER_CHAT = 30; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
 GEMINI_MODEL_NAME = "gemini-2.0-flash"
 BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; CHAR_DESCRIPTIONS = {}
-chat_histories = {}; debounce_tasks = {};
-# --- ИЗМЕНЕНО: Структура pending_replies ---
-pending_replies = {} # Теперь {reply_uuid: (response_text_raw, business_connection_id, target_chat_id)}
-gemini_model = None; MY_TELEGRAM_ID = None
+# chat_histories = {} # <--- УБРАНО: Теперь история в БД
+debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
@@ -41,6 +43,8 @@ if not MY_TELEGRAM_ID_STR: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); 
 try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
 except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not a valid integer."); exit()
 if not GEMINI_API_KEY: logger.critical("CRITICAL: Missing GEMINI_API_KEY"); exit()
+if not DATABASE_URL: logger.critical("CRITICAL: Missing DATABASE_URL for history storage."); exit() # <--- Проверяем URL базы
+
 
 # --- Функция парсинга конфигурационного файла (без изменений) ---
 # ... (код parse_config_file) ...
@@ -70,15 +74,78 @@ def parse_config_file(filepath: str):
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
 
+# --- НОВЫЕ Функции для работы с историей в PostgreSQL ---
+def init_history_db():
+    """Инициализирует таблицу для истории сообщений в PostgreSQL."""
+    sql_create_table = """
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        message_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        role TEXT NOT NULL, -- 'user' или 'model'
+        content TEXT NOT NULL,
+        INDEX idx_chat_id_timestamp (chat_id, message_timestamp DESC) -- Индекс для быстрого извлечения
+    );
+    """
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_create_table)
+                conn.commit()
+        logger.info("PostgreSQL table 'chat_messages' for history checked/created.")
+    except psycopg.Error as e:
+        logger.critical(f"CRITICAL: Failed to initialize history DB table: {e}", exc_info=True)
+        exit()
 
-# --- Функции истории и Gemini (без изменений) ---
-# ... (код update_chat_history, get_formatted_history, generate_gemini_response) ...
 def update_chat_history(chat_id: int, role: str, text: str):
-    if not text or not text.strip(): logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping."); return
-    if chat_id not in chat_histories: chat_histories[chat_id] = deque(maxlen=MAX_HISTORY_PER_CHAT)
-    chat_histories[chat_id].append({"role": role, "parts": [{"text": text.strip()}]})
-    logger.debug(f"Updated history for chat {chat_id}. Role: {role}. New length: {len(chat_histories[chat_id])}")
-def get_formatted_history(chat_id: int) -> list: return list(chat_histories.get(chat_id, []))
+    """Сохраняет сообщение в таблицу chat_messages PostgreSQL."""
+    if not text or not text.strip():
+        logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping.")
+        return
+    
+    clean_text = text.strip()
+    sql_insert = """
+    INSERT INTO chat_messages (chat_id, role, content)
+    VALUES (%s, %s, %s);
+    """
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_insert, (chat_id, role, clean_text))
+                conn.commit()
+        logger.debug(f"Saved message to DB for chat {chat_id}. Role: {role}, Text: '{clean_text[:30]}...'")
+    except psycopg.Error as e:
+        logger.error(f"Failed to save message to history DB for chat {chat_id}: {e}")
+
+def get_formatted_history(chat_id: int) -> list:
+    """Извлекает последние MAX_HISTORY_PER_CHAT сообщений из PostgreSQL."""
+    sql_select = """
+    SELECT role, content FROM chat_messages
+    WHERE chat_id = %s
+    ORDER BY message_timestamp DESC
+    LIMIT %s;
+    """
+    gemini_history = []
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_select, (chat_id, MAX_HISTORY_PER_CHAT))
+                # Результат будет (role, content), нужно преобразовать и перевернуть
+                db_rows = cur.fetchall()
+        
+        # Сообщения из БД приходят в обратном хронологическом порядке, переворачиваем их
+        for row in reversed(db_rows):
+            role, content = row
+            gemini_history.append({"role": role, "parts": [{"text": content}]})
+        
+        logger.debug(f"Retrieved {len(gemini_history)} history entries from DB for chat {chat_id}.")
+        return gemini_history
+    except psycopg.Error as e:
+        logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}")
+        return [] # Возвращаем пустой список при ошибке
+
+# --- Функция для вызова Gemini API (без изменений) ---
+# ... (код generate_gemini_response) ...
 async def generate_gemini_response(dynamic_context_parts: list, chat_history: list) -> str | None:
     global gemini_model;
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
@@ -102,55 +169,31 @@ async def generate_gemini_response(dynamic_context_parts: list, chat_history: li
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
-# --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
-async def process_chat_after_delay(
-    chat_id: int, # ID чата, в который нужно будет ответить
-    sender_name: str, # Имя собеседника для превью
-    sender_id_str: str, # ID собеседника для поиска описания
-    business_connection_id: str | None,
-    context: ContextTypes.DEFAULT_TYPE
-):
+# --- Функция обработки чата ПОСЛЕ задержки (без изменений) ---
+# ... (код process_chat_after_delay) ...
+async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
-    current_history = get_formatted_history(chat_id)
-    dynamic_prompt_parts = []
+    current_history = get_formatted_history(chat_id); dynamic_prompt_parts = []
+    logger.debug(f"Looking for description for sender_id_str: '{sender_id_str}' (type: {type(sender_id_str)})")
     interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
-    if interlocutor_description:
-        logger.info(f"FOUND description for sender {sender_id_str}")
-        dynamic_prompt_parts.append(f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}")
+    if interlocutor_description: logger.info(f"FOUND description for sender {sender_id_str}"); dynamic_prompt_parts.append(f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}")
     else: logger.warning(f"Description NOT FOUND for sender ID {sender_id_str}")
-
+    logger.debug(f"Passing dynamic_prompt_parts to generate_gemini_response: {dynamic_prompt_parts}")
     gemini_response_raw = await generate_gemini_response(dynamic_prompt_parts, current_history)
-
     if gemini_response_raw:
-        # --- ИЗМЕНЕНО: Генерируем уникальный ID для этого ответа ---
         reply_uuid = str(uuid.uuid4())
-        # Сохраняем ответ, ID связи И ID целевого чата по этому UUID
-        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id)
-        logger.debug(f"Stored RAW pending reply with UUID {reply_uuid} for target_chat {chat_id} (ConnID: {business_connection_id})")
-
+        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id); logger.debug(f"Stored RAW pending reply with UUID {reply_uuid}")
         preview_text = gemini_response_raw.replace("!NEWMSG!", "\n\n🔚\n\n")
         try:
-            safe_sender_name = html.escape(sender_name)
-            escaped_preview_text = html.escape(preview_text)
-            reply_text_html = (
-                f"🤖 <b>Предложенный ответ для чата {html.escape(str(chat_id))}</b> (<i>{safe_sender_name}</i>):\n" # Добавил escape для chat_id
-                f"──────────────────\n"
-                f"<code>{escaped_preview_text}</code>"
-            )
-            # --- ИЗМЕНЕНО: callback_data теперь содержит reply_uuid ---
-            callback_data = f"send_{reply_uuid}" # Больше не содержит chat_id и conn_id напрямую
-
+            safe_sender_name = html.escape(sender_name); escaped_preview_text = html.escape(preview_text)
+            reply_text_html = (f"🤖 <b>Предложенный ответ для чата {html.escape(str(chat_id))}</b> (<i>{safe_sender_name}</i>):\n"
+                               f"──────────────────\n<code>{escaped_preview_text}</code>")
+            callback_data = f"send_{reply_uuid}";
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить в чат", callback_data=callback_data)]])
-            await context.bot.send_message(
-                chat_id=MY_TELEGRAM_ID, text=reply_text_html, reply_markup=keyboard, parse_mode=ParseMode.HTML
-            )
+            await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_html, reply_markup=keyboard, parse_mode=ParseMode.HTML)
             logger.info(f"Sent suggestion preview (UUID: {reply_uuid}) for target_chat {chat_id} to {MY_TELEGRAM_ID}")
-        except TelegramError as e:
-            logger.error(f"Failed to send suggestion preview (HTML) to {MY_TELEGRAM_ID}: {e}")
-            # ... (fallback) ...
-    else:
-        logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
-
+        except TelegramError as e: logger.error(f"Failed to send suggestion preview (HTML) to {MY_TELEGRAM_ID}: {e}");
+    else: logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
 # --- Основной обработчик бизнес-сообщений (без изменений) ---
@@ -176,8 +219,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
         transcription = text[3:].strip()
         if transcription:
             logger.info(f"Processing /v command in chat {chat_id}. Transcription: '{transcription[:30]}...'")
-            update_chat_history(chat_id, "user", transcription) # Добавляем как от собеседника
-            # Запускаем дебаунс для /v
+            update_chat_history(chat_id, "user", transcription)
             fictional_sender_name_for_suggestion = chat.first_name or f"Chat_{chat_id}"
             fictional_sender_id_for_description = str(chat_id)
             async def delayed_processing_for_v_command():
@@ -227,82 +269,46 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     debounce_tasks[chat_id] = task
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
-
-# --- ИЗМЕНЕННЫЙ Обработчик нажатий на кнопку ---
+# --- Обработчик нажатий на кнопку (без изменений) ---
+# ... (код button_handler) ...
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query = update.callback_query;
     if not query: logger.warning("Received update without callback_query in button_handler"); return
-
-    logger.info("--- button_handler triggered ---")
-    logger.debug(f"CallbackQuery Data: {query.data}")
+    logger.info("--- button_handler triggered ---"); logger.debug(f"CallbackQuery Data: {query.data}")
     try: await query.answer()
     except Exception as e: logger.error(f"CRITICAL: Failed to answer callback query: {e}. Stopping handler."); return
-
-    data = query.data
-    if not data or not data.startswith("send_"):
-        logger.warning(f"Received unhandled callback_data: {data}"); # ... обработка ошибки ...
-        return
-
-    # --- ИЗМЕНЕНО: Извлекаем UUID ответа из callback_data ---
-    reply_uuid = None
-    response_text_raw = None
-    final_business_connection_id = None
-    target_chat_id_for_send = None # ID чата, куда отправляем
-
+    data = query.data;
+    if not data or not data.startswith("send_"): logger.warning(f"Received unhandled callback_data: {data}"); return
+    reply_uuid = None; response_text_raw = None; final_business_connection_id = None; target_chat_id_for_send = None
     try:
-        reply_uuid = data.split("_", 1)[1] # Ожидаем "send_<uuid>"
+        reply_uuid = data.split("_", 1)[1]
         logger.info(f"Button press: Attempting to process reply with UUID: {reply_uuid}")
-
-        # Получаем данные из pending_replies по UUID
-        pending_data = pending_replies.pop(reply_uuid, None) # Удаляем после извлечения
-
-        if not pending_data:
-            logger.warning(f"No pending reply found for UUID {reply_uuid}. Maybe already sent or bot restarted?")
-            await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Ответ не найден (возможно, уже отправлен или устарел).", parse_mode=ParseMode.HTML, reply_markup=None)
-            return
-
+        pending_data = pending_replies.pop(reply_uuid, None)
+        if not pending_data: logger.warning(f"No pending reply found for UUID {reply_uuid}."); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Ответ не найден.", parse_mode=ParseMode.HTML, reply_markup=None); return
         response_text_raw, final_business_connection_id, target_chat_id_for_send = pending_data
-
-        if not response_text_raw:
-            logger.error(f"Stored raw response_text is None for UUID {reply_uuid}!");
-            await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Внутренняя ошибка (пустой текст ответа).", parse_mode=ParseMode.HTML, reply_markup=None)
-            return
-
+        if not response_text_raw: logger.error(f"Stored raw response_text is None for UUID {reply_uuid}!"); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Пустой текст.", parse_mode=ParseMode.HTML, reply_markup=None); return
         logger.debug(f"Found pending reply for UUID {reply_uuid} (target chat {target_chat_id_for_send}): '{response_text_raw[:50]}...' using ConnID: {final_business_connection_id}")
-
-        # Разбиваем и отправляем по частям (логика без изменений, но использует извлеченные переменные)
         message_parts = [part.strip() for part in response_text_raw.split("!NEWMSG!") if part.strip()]
         total_parts = len(message_parts); sent_count = 0; first_error = None
-        if not message_parts:
-            logger.warning(f"Raw response for UUID {reply_uuid} resulted in no parts!");
-            await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Сгенерирован пустой ответ.", parse_mode=ParseMode.HTML, reply_markup=None)
-            return
-
+        if not message_parts: logger.warning(f"Raw response for UUID {reply_uuid} resulted in no parts!"); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Пустой ответ.", parse_mode=ParseMode.HTML, reply_markup=None); return
         logger.info(f"Attempting to send {total_parts} message parts to chat {target_chat_id_for_send}")
         for i, part_text in enumerate(message_parts):
             logger.debug(f"Sending part {i+1}/{total_parts} to chat {target_chat_id_for_send}")
             try:
-                sent_message = await context.bot.send_message(
-                    chat_id=target_chat_id_for_send,
-                    text=part_text,
-                    business_connection_id=final_business_connection_id
-                )
+                sent_message = await context.bot.send_message(chat_id=target_chat_id_for_send, text=part_text, business_connection_id=final_business_connection_id)
                 logger.info(f"Sent part {i+1}/{total_parts} (MsgID: {sent_message.message_id}) to chat {target_chat_id_for_send}")
                 update_chat_history(target_chat_id_for_send, "model", part_text)
                 sent_count += 1
                 if total_parts > 1 and i < total_parts - 1: await asyncio.sleep(MESSAGE_SPLIT_DELAY)
             except Exception as e: logger.error(f"Failed to send part {i+1}/{total_parts}: {type(e).__name__}: {e}", exc_info=True); first_error = e; break
-
-        final_text = query.message.text_html # Обновляем сообщение с кнопкой
+        final_text = query.message.text_html
         if first_error: error_text = f"<b>❌ Ошибка при отправке части {sent_count + 1}/{total_parts}:</b> {html.escape(str(first_error))}"; final_text += f"\n\n{error_text}"
         elif sent_count == total_parts: final_text += "\n\n<b>✅ Отправлено!</b>"; logger.info(f"Finished sending all parts for chat {target_chat_id_for_send}.")
         else: final_text += "\n\n<b>⚠️ Неизвестный результат.</b>"; logger.error(f"Unexpected state after sending parts for {target_chat_id_for_send}.")
         try: await query.edit_message_text(text=final_text, parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception as edit_e: logger.error(f"Failed to edit original suggestion message: {edit_e}")
-
-    except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}' or processing reply for UUID {reply_uuid}: {e}"); # ... обработка ошибки ...
-    except Exception as e: logger.error(f"Unexpected error in button_handler (UUID {reply_uuid}): {e}", exc_info=True); # ... обработка ошибки ...
-
+    except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}' or processing reply for UUID {reply_uuid}: {e}");
+    except Exception as e: logger.error(f"Unexpected error in button_handler (UUID {reply_uuid}): {e}", exc_info=True);
 
 # --- Функция post_init (без изменений) ---
 # ... (код post_init) ...
@@ -320,11 +326,17 @@ async def post_init(application: Application):
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-# --- Основная точка входа (без изменений) ---
-# ... (код __main__) ...
+# --- Основная точка входа ---
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
+
+    # Парсим конфигурацию СНАЧАЛА
     parse_config_file(CONFIG_FILE)
+
+    # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ИСТОРИИ ---
+    init_history_db() # <--- ВЫЗЫВАЕМ ИНИЦИАЛИЗАЦИЮ ТАБЛИЦЫ ИСТОРИИ
+
+    # Инициализируем Gemini
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=BASE_SYSTEM_PROMPT)
@@ -339,7 +351,9 @@ if __name__ == "__main__":
     logger.info("Application built. Starting webhook listener...")
     try:
         webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-        asyncio.run(application.run_webhook(listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=webhook_full_url))
+        asyncio.run(application.run_webhook(
+            listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=webhook_full_url
+        ))
     except ValueError as e: logger.critical(f"CRITICAL ERROR asyncio.run: {e}", exc_info=True)
     except Exception as e: logger.critical(f"CRITICAL ERROR Webhook server: {e}", exc_info=True)
     finally: logger.info("Webhook server shut down.")
