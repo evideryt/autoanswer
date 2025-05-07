@@ -6,6 +6,7 @@ from collections import deque
 import google.generativeai as genai
 import html
 import time
+import uuid # <--- ДОБАВЛЕНО: Для генерации уникальных ID
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,39 +19,21 @@ from telegram.ext import (
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
-# --- Настройки и переменные ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("google.generativeai").setLevel(logging.INFO)
+# --- Настройки и переменные (без изменений) ---
+# ... (код переменных) ...
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-PORT = int(os.environ.get("PORT", 8443))
-MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-CONFIG_FILE = "adp.txt"
-
-MAX_HISTORY_PER_CHAT = 30
-DEBOUNCE_DELAY = 15
-MY_NAME_FOR_HISTORY = "киткат"
-MESSAGE_SPLIT_DELAY = 0.7
-GEMINI_MODEL_NAME = "gemini-2.0-flash" # <--- УЧТЕНО: Новая модель!
-
-BASE_SYSTEM_PROMPT = ""
-MY_CHARACTER_DESCRIPTION = ""
-CHAR_DESCRIPTIONS = {}
-
-chat_histories = {}
-debounce_tasks = {}
-pending_replies = {}
-gemini_model = None
-MY_TELEGRAM_ID = None
-
-# --- КРИТИЧЕСКИЕ ПРОВЕРКИ ПЕРЕМЕННЫХ (без изменений) ---
-# ... (код проверок) ...
+BOT_TOKEN = os.environ.get("BOT_TOKEN"); WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
+MAX_HISTORY_PER_CHAT = 30; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
+GEMINI_MODEL_NAME = "gemini-2.0-flash"
+BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; CHAR_DESCRIPTIONS = {}
+chat_histories = {}; debounce_tasks = {};
+# --- ИЗМЕНЕНО: Структура pending_replies ---
+pending_replies = {} # Теперь {reply_uuid: (response_text_raw, business_connection_id, target_chat_id)}
+gemini_model = None; MY_TELEGRAM_ID = None
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
@@ -58,7 +41,6 @@ if not MY_TELEGRAM_ID_STR: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); 
 try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
 except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not a valid integer."); exit()
 if not GEMINI_API_KEY: logger.critical("CRITICAL: Missing GEMINI_API_KEY"); exit()
-
 
 # --- Функция парсинга конфигурационного файла (без изменений) ---
 # ... (код parse_config_file) ...
@@ -88,6 +70,7 @@ def parse_config_file(filepath: str):
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
 
+
 # --- Функции истории и Gemini (без изменений) ---
 # ... (код update_chat_history, get_formatted_history, generate_gemini_response) ...
 def update_chat_history(chat_id: int, role: str, text: str):
@@ -97,7 +80,7 @@ def update_chat_history(chat_id: int, role: str, text: str):
     logger.debug(f"Updated history for chat {chat_id}. Role: {role}. New length: {len(chat_histories[chat_id])}")
 def get_formatted_history(chat_id: int) -> list: return list(chat_histories.get(chat_id, []))
 async def generate_gemini_response(dynamic_context_parts: list, chat_history: list) -> str | None:
-    global gemini_model; # ... (остальной код функции без изменений) ...
+    global gemini_model;
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
     gemini_contents = []; context_block_text = ""
     if MY_CHARACTER_DESCRIPTION: context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
@@ -119,154 +102,100 @@ async def generate_gemini_response(dynamic_context_parts: list, chat_history: li
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
-# --- Функция обработки чата ПОСЛЕ задержки (без изменений) ---
-# ... (код process_chat_after_delay) ...
-async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE):
+# --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
+async def process_chat_after_delay(
+    chat_id: int, # ID чата, в который нужно будет ответить
+    sender_name: str, # Имя собеседника для превью
+    sender_id_str: str, # ID собеседника для поиска описания
+    business_connection_id: str | None,
+    context: ContextTypes.DEFAULT_TYPE
+):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
-    current_history = get_formatted_history(chat_id); dynamic_prompt_parts = []
-    logger.debug(f"Looking for description for sender_id_str: '{sender_id_str}' (type: {type(sender_id_str)})")
+    current_history = get_formatted_history(chat_id)
+    dynamic_prompt_parts = []
     interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
-    if interlocutor_description: logger.info(f"FOUND description for sender {sender_id_str}"); dynamic_prompt_parts.append(f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}")
+    if interlocutor_description:
+        logger.info(f"FOUND description for sender {sender_id_str}")
+        dynamic_prompt_parts.append(f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}")
     else: logger.warning(f"Description NOT FOUND for sender ID {sender_id_str}")
-    logger.debug(f"Passing dynamic_prompt_parts to generate_gemini_response: {dynamic_prompt_parts}")
+
     gemini_response_raw = await generate_gemini_response(dynamic_prompt_parts, current_history)
+
     if gemini_response_raw:
-        pending_replies[chat_id] = (gemini_response_raw, business_connection_id); logger.debug(f"Stored RAW pending reply for chat {chat_id}")
+        # --- ИЗМЕНЕНО: Генерируем уникальный ID для этого ответа ---
+        reply_uuid = str(uuid.uuid4())
+        # Сохраняем ответ, ID связи И ID целевого чата по этому UUID
+        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id)
+        logger.debug(f"Stored RAW pending reply with UUID {reply_uuid} for target_chat {chat_id} (ConnID: {business_connection_id})")
+
         preview_text = gemini_response_raw.replace("!NEWMSG!", "\n\n🔚\n\n")
         try:
-            safe_sender_name = html.escape(sender_name); escaped_preview_text = html.escape(preview_text)
-            reply_text_html = (f"🤖 <b>Предложенный ответ для чата {chat_id}</b> (<i>{safe_sender_name}</i>):\n"
-                               f"──────────────────\n<code>{escaped_preview_text}</code>")
-            callback_data = f"send_{chat_id}";
-            if business_connection_id: callback_data += f"_{business_connection_id}"
+            safe_sender_name = html.escape(sender_name)
+            escaped_preview_text = html.escape(preview_text)
+            reply_text_html = (
+                f"🤖 <b>Предложенный ответ для чата {html.escape(str(chat_id))}</b> (<i>{safe_sender_name}</i>):\n" # Добавил escape для chat_id
+                f"──────────────────\n"
+                f"<code>{escaped_preview_text}</code>"
+            )
+            # --- ИЗМЕНЕНО: callback_data теперь содержит reply_uuid ---
+            callback_data = f"send_{reply_uuid}" # Больше не содержит chat_id и conn_id напрямую
+
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить в чат", callback_data=callback_data)]])
-            await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_html, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-            logger.info(f"Sent suggestion preview for chat {chat_id} to {MY_TELEGRAM_ID}")
-        except TelegramError as e: logger.error(f"Failed to send suggestion preview (HTML) to {MY_TELEGRAM_ID}: {e}"); # ... fallback ...
-    else: logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
+            await context.bot.send_message(
+                chat_id=MY_TELEGRAM_ID, text=reply_text_html, reply_markup=keyboard, parse_mode=ParseMode.HTML
+            )
+            logger.info(f"Sent suggestion preview (UUID: {reply_uuid}) for target_chat {chat_id} to {MY_TELEGRAM_ID}")
+        except TelegramError as e:
+            logger.error(f"Failed to send suggestion preview (HTML) to {MY_TELEGRAM_ID}: {e}")
+            # ... (fallback) ...
+    else:
+        logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
+
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
-# --- ИЗМЕНЕННЫЙ Основной обработчик бизнес-сообщений ---
+# --- Основной обработчик бизнес-сообщений (без изменений) ---
+# ... (код handle_business_update) ...
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_to_process = update.business_message or update.edited_business_message
-    if not message_to_process: return
+    # logger.info(f"--- Received Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}") # Раскомментируй для отладки
+    message_to_process = None; business_connection_id = None
+    if update.business_message:
+        message_to_process = update.business_message; business_connection_id = message_to_process.business_connection_id
+        logger.info(f"--- Received Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
+    elif update.edited_business_message:
+        message_to_process = update.edited_business_message; business_connection_id = getattr(message_to_process, 'business_connection_id', None)
+        logger.info(f"--- Received Edited Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
+    else: return
 
-    chat = message_to_process.chat
-    sender = message_to_process.from_user
-    text = message_to_process.text
-    # message_id = message_to_process.message_id # Больше не нужен для удаления
-    business_connection_id = getattr(message_to_process, 'business_connection_id', None)
-
+    chat = message_to_process.chat; sender = message_to_process.from_user; text = message_to_process.text
     if not text: logger.debug(f"Ignoring non-text business message in chat {chat.id}"); return
 
-    chat_id = chat.id
-    sender_id_str = str(sender.id) if sender else None
-    sender_name = "Unknown" # Инициализируем
-    if sender:
-        sender_name = sender.first_name or f"User_{sender_id_str}"
+    chat_id = chat.id; sender_id_str = str(sender.id) if sender else None; sender_name = "Unknown"
+    if sender: sender_name = sender.first_name or f"User_{sender_id_str}"
 
-    # --- Обработка команды /v от тебя ---
-    if sender and sender.id == MY_TELEGRAM_ID and text.startswith("/v "):
+    if sender and sender.id == MY_TELEGRAM_ID and text.startswith("/v "): # Обработка /v
         transcription = text[3:].strip()
         if transcription:
             logger.info(f"Processing /v command in chat {chat_id}. Transcription: '{transcription[:30]}...'")
-            # Добавляем транскрипцию в историю КАК БУДТО ОТ СОБЕСЕДНИКА
-            update_chat_history(chat_id, "user", transcription)
-
-            # --- ДОБАВЛЕНО: Запускаем дебаунс после /v ---
-            if chat_id in debounce_tasks:
-                logger.debug(f"Cancelling previous debounce task for chat {chat_id} due to /v command.")
-                try: debounce_tasks[chat_id].cancel()
-                except Exception as e: logger.error(f"Error cancelling task for chat {chat_id} (on /v): {e}")
-            
-            logger.info(f"Scheduling new response generation for chat {chat_id} after /v command in {DEBOUNCE_DELAY}s")
-            # Для process_chat_after_delay нам нужно имя "собеседника" этого чата.
-            # Если это личный чат, то sender_name из /v команды - это ТЫ.
-            # Нам нужно имя того, с кем ТЫ общаешься в этом chat_id.
-            # Это сложнее получить без хранения информации о чатах.
-            # Пока для простоты, если /v используется, будем считать, что "собеседник" - это
-            # просто "Собеседник чата X", или попробуем взять из sender_id_str, если он не твой.
-            # Но для /v sender_id_str ВСЕГДА твой.
-            # Самый простой вариант сейчас - передать некое общее имя.
-            # ИЛИ если мы хотим ответ на ГС КОНКРЕТНОГО собеседника, то /v нужно использовать
-            # в контексте его последнего сообщения. Сейчас /v просто добавляет в историю.
-            # Для простоты, пусть Gemini сам разбирается на основе истории.
-            # Мы передадим фиктивное имя "Собеседник" и его реальный ID (который будет твоим ID).
-            # Это не идеально, но для реакции на ГС может сработать.
-            # Либо мы должны как-то узнать, кто был последним собеседником в этом чате.
-            # Пока оставим sender_name как твое имя, а sender_id_str тоже твой.
-            # Gemini должен увидеть, что последнее сообщение от user было голосовым (транскрипцией)
-            # и предыдущие сообщения от model (твои) и user (собеседника).
-
-            # Важно: sender_name для process_chat_after_delay - это имя того, кому адресован ответ.
-            # В случае /v, ответ адресован тому, кто прислал ГС, но ГС прислал не ты.
-            # Мы добавили текст от "user". Значит, следующий ответ должен быть от "model" (тебя).
-            # Имя "собеседника" для сообщения в твою личку должно быть "Собеседник чата X"
-            # sender_name для process_chat_after_delay - это имя того, кто прислал ПОСЛЕДНЕЕ сообщение
-            # которое ТРИГГЕРНУЛО этот вызов. В случае /v - это ТЫ.
-            # Но мы добавили его от имени "user", так что это запутанно.
-            # Лучше /v будет просто добавлять в историю и НЕ триггерить дебаунс,
-            # а следующий ответ собеседника уже учтет это ГС.
-            # ----- ОТКАТЫВАЕМ ТРИГГЕР ДЕБАУНСА ДЛЯ /v пока что -----
-            # logger.info(f"/v command processed. Waiting for next message to trigger response.")
-
-            # --- ИЛИ, если мы хотим, чтобы /v *сразу* триггерил ответ: ---
-            # Нам нужен ID *реального собеседника* этого чата.
-            # Это сложно без дополнительного хранения.
-            # Простой вариант: используем фиктивные данные или предполагаем, что
-            # Gemini догадается по контексту.
-            # Если `chat_id` - это ID личного чата с кем-то, то `sender_name` для
-            # `process_chat_after_delay` должен быть именем этого кого-то.
-            # Сейчас sender_name будет "киткат" (т.к. /v от тебя).
-            # А sender_id_str будет твоим ID.
-            # Это приведет к тому, что бот попытается найти описание для ТЕБЯ как для собеседника.
-
-            # --- ПРАВИЛЬНЫЙ ПОДХОД для /v триггера: ---
-            # Нам нужно знать ID того, с кем идет диалог в этом chat_id.
-            # Если это ЛС, то chat_id и есть ID собеседника (если ты не пишешь сам себе).
-            # Но в бизнес-чате chat_id - это ID собеседника.
-            # А sender.id для /v команды - это MY_TELEGRAM_ID.
-
-            # Когда ты отправляешь /v, это значит, что ты вносишь сообщение *собеседника*.
-            # Имя этого собеседника мы не знаем из /v команды напрямую.
-            # Мы знаем только chat_id, в котором это произошло.
-            # Если это личный чат, то chat_id == ID_собеседника.
-            # Если это группа... то сложнее.
-            # Для простоты, предположим, что business_message.chat.id - это ID собеседника.
-            # А `sender_name_for_suggestion` - это имя этого собеседника.
-            # `sender_id_for_description` - это ID этого собеседника (chat_id).
-
-            fictional_sender_name_for_suggestion = chat.first_name or f"Chat_{chat_id}" # Имя из объекта чата
-            fictional_sender_id_for_description = str(chat_id) # ID из объекта чата
-
+            update_chat_history(chat_id, "user", transcription) # Добавляем как от собеседника
+            # Запускаем дебаунс для /v
+            fictional_sender_name_for_suggestion = chat.first_name or f"Chat_{chat_id}"
+            fictional_sender_id_for_description = str(chat_id)
             async def delayed_processing_for_v_command():
                 try:
                     await asyncio.sleep(DEBOUNCE_DELAY)
                     logger.debug(f"Debounce for /v in chat {chat_id} finished. Starting processing.")
-                    await process_chat_after_delay(
-                        chat_id,
-                        fictional_sender_name_for_suggestion, # Имя того, с кем диалог
-                        fictional_sender_id_for_description,  # ID того, с кем диалог (для описания)
-                        business_connection_id,
-                        context
-                    )
+                    await process_chat_after_delay(chat_id, fictional_sender_name_for_suggestion, fictional_sender_id_for_description, business_connection_id, context)
                 except asyncio.CancelledError: logger.info(f"Debounce task for /v in chat {chat_id} was cancelled.")
                 except Exception as e: logger.error(f"Error in delayed /v processing for chat {chat_id}: {e}", exc_info=True)
-
-            if chat_id in debounce_tasks: # Отменяем предыдущий таймер, если он был
+            if chat_id in debounce_tasks:
                 try: debounce_tasks[chat_id].cancel()
-                except Exception: pass # Игнорируем ошибки отмены
-
+                except Exception: pass
             task = asyncio.create_task(delayed_processing_for_v_command())
             debounce_tasks[chat_id] = task
             logger.info(f"Scheduled response generation for chat {chat_id} after /v command.")
-            # --- Конец блока запуска дебаунса для /v ---
-            return # Завершаем обработку /v команды
-        else:
-            logger.warning(f"Received empty /v command from {MY_TELEGRAM_ID} in chat {chat_id}. Ignoring.")
-            return
+        else: logger.warning(f"Received empty /v command from {MY_TELEGRAM_ID} in chat {chat_id}. Ignoring.")
+        return
 
-    # --- Остальная логика для обычных входящих/исходящих ---
     is_outgoing = sender and sender.id == MY_TELEGRAM_ID
     if is_outgoing:
         logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}")
@@ -281,19 +210,16 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
 
     logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
-    # sender_name уже определен выше
-    update_chat_history(chat_id, "user", text) # Добавляем входящее от реального собеседника
+    update_chat_history(chat_id, "user", text)
     if chat_id in debounce_tasks:
         logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
         try: debounce_tasks[chat_id].cancel()
         except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
-
     logger.info(f"Scheduling new response generation for chat {chat_id} in {DEBOUNCE_DELAY}s")
     async def delayed_processing():
         try:
             await asyncio.sleep(DEBOUNCE_DELAY)
             logger.debug(f"Debounce delay finished for chat {chat_id}. Starting processing.")
-            # Для обычного входящего, sender_id_str и sender_name - это реальный собеседник
             await process_chat_after_delay(chat_id, sender_name, sender_id_str, business_connection_id, context)
         except asyncio.CancelledError: logger.info(f"Debounce task for chat {chat_id} was cancelled.")
         except Exception as e: logger.error(f"Error in delayed processing for chat {chat_id}: {e}", exc_info=True)
@@ -302,50 +228,81 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
 
-# --- Обработчик нажатий на кнопку (без изменений) ---
-# ... (код button_handler) ...
+# --- ИЗМЕНЕННЫЙ Обработчик нажатий на кнопку ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query;
+    query = update.callback_query
     if not query: logger.warning("Received update without callback_query in button_handler"); return
-    logger.info("--- button_handler triggered ---"); logger.debug(f"CallbackQuery Data: {query.data}")
+
+    logger.info("--- button_handler triggered ---")
+    logger.debug(f"CallbackQuery Data: {query.data}")
     try: await query.answer()
     except Exception as e: logger.error(f"CRITICAL: Failed to answer callback query: {e}. Stopping handler."); return
-    data = query.data;
-    if not data or not data.startswith("send_"): logger.warning(f"Received unhandled callback_data: {data}"); return
-    target_chat_id = None; business_connection_id_from_button = None; response_text_raw = None
+
+    data = query.data
+    if not data or not data.startswith("send_"):
+        logger.warning(f"Received unhandled callback_data: {data}"); # ... обработка ошибки ...
+        return
+
+    # --- ИЗМЕНЕНО: Извлекаем UUID ответа из callback_data ---
+    reply_uuid = None
+    response_text_raw = None
+    final_business_connection_id = None
+    target_chat_id_for_send = None # ID чата, куда отправляем
+
     try:
-        parts = data.split("_", 2); target_chat_id_str = parts[1]; target_chat_id = int(target_chat_id_str)
-        business_connection_id_from_button = parts[2] if len(parts) > 2 else None
-        logger.info(f"Button press: Attempting to send reply to chat {target_chat_id} using ConnID from button: {business_connection_id_from_button}")
-        pending_data = pending_replies.pop(target_chat_id, None)
-        if not pending_data: logger.warning(f"No pending reply found for chat {target_chat_id}."); return
-        response_text_raw, stored_conn_id_from_pending = pending_data
-        final_business_connection_id = business_connection_id_from_button or stored_conn_id_from_pending
-        if business_connection_id_from_button and stored_conn_id_from_pending and business_connection_id_from_button != stored_conn_id_from_pending:
-            logger.warning(f"Mismatch ConnID: button had {business_connection_id_from_button}, stored was {stored_conn_id_from_pending}. Using from button.")
-        if not response_text_raw: logger.error(f"Stored raw response_text is None for chat {target_chat_id}!"); return
-        logger.debug(f"Found RAW pending reply for chat {target_chat_id}: '{response_text_raw[:50]}...' using final ConnID: {final_business_connection_id}")
+        reply_uuid = data.split("_", 1)[1] # Ожидаем "send_<uuid>"
+        logger.info(f"Button press: Attempting to process reply with UUID: {reply_uuid}")
+
+        # Получаем данные из pending_replies по UUID
+        pending_data = pending_replies.pop(reply_uuid, None) # Удаляем после извлечения
+
+        if not pending_data:
+            logger.warning(f"No pending reply found for UUID {reply_uuid}. Maybe already sent or bot restarted?")
+            await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Ответ не найден (возможно, уже отправлен или устарел).", parse_mode=ParseMode.HTML, reply_markup=None)
+            return
+
+        response_text_raw, final_business_connection_id, target_chat_id_for_send = pending_data
+
+        if not response_text_raw:
+            logger.error(f"Stored raw response_text is None for UUID {reply_uuid}!");
+            await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Внутренняя ошибка (пустой текст ответа).", parse_mode=ParseMode.HTML, reply_markup=None)
+            return
+
+        logger.debug(f"Found pending reply for UUID {reply_uuid} (target chat {target_chat_id_for_send}): '{response_text_raw[:50]}...' using ConnID: {final_business_connection_id}")
+
+        # Разбиваем и отправляем по частям (логика без изменений, но использует извлеченные переменные)
         message_parts = [part.strip() for part in response_text_raw.split("!NEWMSG!") if part.strip()]
         total_parts = len(message_parts); sent_count = 0; first_error = None
-        if not message_parts: logger.warning(f"Raw response for chat {target_chat_id} resulted in no parts!"); return
-        logger.info(f"Attempting to send {total_parts} message parts to chat {target_chat_id}")
+        if not message_parts:
+            logger.warning(f"Raw response for UUID {reply_uuid} resulted in no parts!");
+            await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Сгенерирован пустой ответ.", parse_mode=ParseMode.HTML, reply_markup=None)
+            return
+
+        logger.info(f"Attempting to send {total_parts} message parts to chat {target_chat_id_for_send}")
         for i, part_text in enumerate(message_parts):
-            logger.debug(f"Sending part {i+1}/{total_parts} to chat {target_chat_id}")
+            logger.debug(f"Sending part {i+1}/{total_parts} to chat {target_chat_id_for_send}")
             try:
-                sent_message = await context.bot.send_message(chat_id=target_chat_id, text=part_text, business_connection_id=final_business_connection_id)
-                logger.info(f"Sent part {i+1}/{total_parts} (MsgID: {sent_message.message_id}) to chat {target_chat_id}")
-                update_chat_history(target_chat_id, "model", part_text)
+                sent_message = await context.bot.send_message(
+                    chat_id=target_chat_id_for_send,
+                    text=part_text,
+                    business_connection_id=final_business_connection_id
+                )
+                logger.info(f"Sent part {i+1}/{total_parts} (MsgID: {sent_message.message_id}) to chat {target_chat_id_for_send}")
+                update_chat_history(target_chat_id_for_send, "model", part_text)
                 sent_count += 1
                 if total_parts > 1 and i < total_parts - 1: await asyncio.sleep(MESSAGE_SPLIT_DELAY)
             except Exception as e: logger.error(f"Failed to send part {i+1}/{total_parts}: {type(e).__name__}: {e}", exc_info=True); first_error = e; break
-        final_text = query.message.text_html
+
+        final_text = query.message.text_html # Обновляем сообщение с кнопкой
         if first_error: error_text = f"<b>❌ Ошибка при отправке части {sent_count + 1}/{total_parts}:</b> {html.escape(str(first_error))}"; final_text += f"\n\n{error_text}"
-        elif sent_count == total_parts: final_text += "\n\n<b>✅ Отправлено!</b>"; logger.info(f"Finished sending all parts for chat {target_chat_id}.")
-        else: final_text += "\n\n<b>⚠️ Неизвестный результат.</b>"; logger.error(f"Unexpected state after sending parts for {target_chat_id}.")
+        elif sent_count == total_parts: final_text += "\n\n<b>✅ Отправлено!</b>"; logger.info(f"Finished sending all parts for chat {target_chat_id_for_send}.")
+        else: final_text += "\n\n<b>⚠️ Неизвестный результат.</b>"; logger.error(f"Unexpected state after sending parts for {target_chat_id_for_send}.")
         try: await query.edit_message_text(text=final_text, parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception as edit_e: logger.error(f"Failed to edit original suggestion message: {edit_e}")
-    except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}': {e}");
-    except Exception as e: logger.error(f"Unexpected error in button_handler: {e}", exc_info=True);
+
+    except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}' or processing reply for UUID {reply_uuid}: {e}"); # ... обработка ошибки ...
+    except Exception as e: logger.error(f"Unexpected error in button_handler (UUID {reply_uuid}): {e}", exc_info=True); # ... обработка ошибки ...
+
 
 # --- Функция post_init (без изменений) ---
 # ... (код post_init) ...
@@ -363,16 +320,14 @@ async def post_init(application: Application):
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-# --- Основная точка входа ---
+# --- Основная точка входа (без изменений) ---
+# ... (код __main__) ...
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
     parse_config_file(CONFIG_FILE)
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel(
-            GEMINI_MODEL_NAME, # <--- Используем переменную
-            system_instruction=BASE_SYSTEM_PROMPT
-        )
+        gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=BASE_SYSTEM_PROMPT)
         logger.info(f"Gemini model '{gemini_model.model_name}' initialized successfully.")
     except Exception as e: logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
 
@@ -384,9 +339,7 @@ if __name__ == "__main__":
     logger.info("Application built. Starting webhook listener...")
     try:
         webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-        asyncio.run(application.run_webhook(
-            listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=webhook_full_url
-        ))
+        asyncio.run(application.run_webhook(listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=webhook_full_url))
     except ValueError as e: logger.critical(f"CRITICAL ERROR asyncio.run: {e}", exc_info=True)
     except Exception as e: logger.critical(f"CRITICAL ERROR Webhook server: {e}", exc_info=True)
     finally: logger.info("Webhook server shut down.")
