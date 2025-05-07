@@ -3,3 +3,4 @@ requests
 httpx
 google-generativeai
 psycopg
+pytz
