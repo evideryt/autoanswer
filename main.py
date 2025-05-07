@@ -2,7 +2,7 @@ import logging
 import os
 import asyncio
 import json
-from collections import deque # Больше не нужен для основной истории, но оставим для возможного использования
+from collections import deque
 import google.generativeai as genai
 import html
 import time
@@ -21,20 +21,18 @@ from telegram.ext import (
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
-# --- Настройки и переменные (без изменений) ---
-# ... (все переменные остаются) ...
+# --- Настройки и переменные ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
-logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING) # Уменьшаем логи psycopg
+logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN"); WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
-DATABASE_URL = os.environ.get("DATABASE_URL") # <--- Убедимся, что читаем URL базы
+DATABASE_URL = os.environ.get("DATABASE_URL")
 MAX_HISTORY_PER_CHAT = 30; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
 GEMINI_MODEL_NAME = "gemini-2.0-flash"
 BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; CHAR_DESCRIPTIONS = {}
-# chat_histories = {} # <--- УБРАНО: Теперь история в БД
 debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
@@ -43,8 +41,7 @@ if not MY_TELEGRAM_ID_STR: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); 
 try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
 except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not a valid integer."); exit()
 if not GEMINI_API_KEY: logger.critical("CRITICAL: Missing GEMINI_API_KEY"); exit()
-if not DATABASE_URL: logger.critical("CRITICAL: Missing DATABASE_URL for history storage."); exit() # <--- Проверяем URL базы
-
+if not DATABASE_URL: logger.critical("CRITICAL: Missing DATABASE_URL for history storage."); exit()
 
 # --- Функция парсинга конфигурационного файла (без изменений) ---
 # ... (код parse_config_file) ...
@@ -74,77 +71,58 @@ def parse_config_file(filepath: str):
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
 
-# --- НОВЫЕ Функции для работы с историей в PostgreSQL ---
+
+# --- ИСПРАВЛЕННАЯ Функция инициализации БД истории ---
 def init_history_db():
-    """Инициализирует таблицу для истории сообщений в PostgreSQL."""
+    """Инициализирует таблицу и индекс для истории сообщений в PostgreSQL."""
     sql_create_table = """
     CREATE TABLE IF NOT EXISTS chat_messages (
         id SERIAL PRIMARY KEY,
         chat_id BIGINT NOT NULL,
         message_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         role TEXT NOT NULL, -- 'user' или 'model'
-        content TEXT NOT NULL,
-        INDEX idx_chat_id_timestamp (chat_id, message_timestamp DESC) -- Индекс для быстрого извлечения
+        content TEXT NOT NULL
     );
     """
+    sql_create_index = """
+    CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc
+    ON chat_messages (chat_id, message_timestamp DESC);
+    """
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
+                logger.debug("Executing CREATE TABLE IF NOT EXISTS...")
                 cur.execute(sql_create_table)
-                conn.commit()
-        logger.info("PostgreSQL table 'chat_messages' for history checked/created.")
+                logger.debug("Executing CREATE INDEX IF NOT EXISTS...")
+                cur.execute(sql_create_index) # Выполняем создание индекса
+                conn.commit() # Коммитим обе операции
+        logger.info("PostgreSQL table 'chat_messages' and index checked/created.")
     except psycopg.Error as e:
-        logger.critical(f"CRITICAL: Failed to initialize history DB table: {e}", exc_info=True)
+        logger.critical(f"CRITICAL: Failed to initialize history DB table/index: {e}", exc_info=True)
         exit()
 
+# --- Остальные функции БД (update/get) и другие хендлеры БЕЗ ИЗМЕНЕНИЙ ---
+# ... (код update_chat_history, get_formatted_history) ...
 def update_chat_history(chat_id: int, role: str, text: str):
-    """Сохраняет сообщение в таблицу chat_messages PostgreSQL."""
-    if not text or not text.strip():
-        logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping.")
-        return
-    
+    if not text or not text.strip(): logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping."); return
     clean_text = text.strip()
-    sql_insert = """
-    INSERT INTO chat_messages (chat_id, role, content)
-    VALUES (%s, %s, %s);
-    """
+    sql_insert = "INSERT INTO chat_messages (chat_id, role, content) VALUES (%s, %s, %s);"
     try:
         with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql_insert, (chat_id, role, clean_text))
-                conn.commit()
+            with conn.cursor() as cur: cur.execute(sql_insert, (chat_id, role, clean_text)); conn.commit()
         logger.debug(f"Saved message to DB for chat {chat_id}. Role: {role}, Text: '{clean_text[:30]}...'")
-    except psycopg.Error as e:
-        logger.error(f"Failed to save message to history DB for chat {chat_id}: {e}")
-
+    except psycopg.Error as e: logger.error(f"Failed to save message to history DB for chat {chat_id}: {e}")
 def get_formatted_history(chat_id: int) -> list:
-    """Извлекает последние MAX_HISTORY_PER_CHAT сообщений из PostgreSQL."""
-    sql_select = """
-    SELECT role, content FROM chat_messages
-    WHERE chat_id = %s
-    ORDER BY message_timestamp DESC
-    LIMIT %s;
-    """
+    sql_select = "SELECT role, content FROM chat_messages WHERE chat_id = %s ORDER BY message_timestamp DESC LIMIT %s;"
     gemini_history = []
     try:
         with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql_select, (chat_id, MAX_HISTORY_PER_CHAT))
-                # Результат будет (role, content), нужно преобразовать и перевернуть
-                db_rows = cur.fetchall()
-        
-        # Сообщения из БД приходят в обратном хронологическом порядке, переворачиваем их
-        for row in reversed(db_rows):
-            role, content = row
-            gemini_history.append({"role": role, "parts": [{"text": content}]})
-        
+            with conn.cursor() as cur: cur.execute(sql_select, (chat_id, MAX_HISTORY_PER_CHAT)); db_rows = cur.fetchall()
+        for row in reversed(db_rows): role, content = row; gemini_history.append({"role": role, "parts": [{"text": content}]})
         logger.debug(f"Retrieved {len(gemini_history)} history entries from DB for chat {chat_id}.")
         return gemini_history
-    except psycopg.Error as e:
-        logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}")
-        return [] # Возвращаем пустой список при ошибке
+    except psycopg.Error as e: logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}"); return []
 
-# --- Функция для вызова Gemini API (без изменений) ---
 # ... (код generate_gemini_response) ...
 async def generate_gemini_response(dynamic_context_parts: list, chat_history: list) -> str | None:
     global gemini_model;
@@ -169,7 +147,6 @@ async def generate_gemini_response(dynamic_context_parts: list, chat_history: li
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
-# --- Функция обработки чата ПОСЛЕ задержки (без изменений) ---
 # ... (код process_chat_after_delay) ...
 async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
@@ -196,7 +173,6 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str
     else: logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce.")
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
-# --- Основной обработчик бизнес-сообщений (без изменений) ---
 # ... (код handle_business_update) ...
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # logger.info(f"--- Received Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}") # Раскомментируй для отладки
@@ -220,6 +196,9 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
         if transcription:
             logger.info(f"Processing /v command in chat {chat_id}. Transcription: '{transcription[:30]}...'")
             update_chat_history(chat_id, "user", transcription)
+            # НЕ УДАЛЯЕМ СООБЩЕНИЕ
+            logger.info(f"Message with /v command in chat {chat_id} was not deleted.")
+            # Запускаем дебаунс для /v
             fictional_sender_name_for_suggestion = chat.first_name or f"Chat_{chat_id}"
             fictional_sender_id_for_description = str(chat_id)
             async def delayed_processing_for_v_command():
@@ -269,7 +248,6 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     debounce_tasks[chat_id] = task
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
-# --- Обработчик нажатий на кнопку (без изменений) ---
 # ... (код button_handler) ...
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query;
@@ -287,7 +265,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pending_data: logger.warning(f"No pending reply found for UUID {reply_uuid}."); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Ответ не найден.", parse_mode=ParseMode.HTML, reply_markup=None); return
         response_text_raw, final_business_connection_id, target_chat_id_for_send = pending_data
         if not response_text_raw: logger.error(f"Stored raw response_text is None for UUID {reply_uuid}!"); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Пустой текст.", parse_mode=ParseMode.HTML, reply_markup=None); return
-        logger.debug(f"Found pending reply for UUID {reply_uuid} (target chat {target_chat_id_for_send}): '{response_text_raw[:50]}...' using ConnID: {final_business_connection_id}")
+        logger.debug(f"Found RAW pending reply for UUID {reply_uuid} (target chat {target_chat_id_for_send}): '{response_text_raw[:50]}...' using ConnID: {final_business_connection_id}")
         message_parts = [part.strip() for part in response_text_raw.split("!NEWMSG!") if part.strip()]
         total_parts = len(message_parts); sent_count = 0; first_error = None
         if not message_parts: logger.warning(f"Raw response for UUID {reply_uuid} resulted in no parts!"); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Пустой ответ.", parse_mode=ParseMode.HTML, reply_markup=None); return
@@ -326,17 +304,12 @@ async def post_init(application: Application):
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
 
+
 # --- Основная точка входа ---
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
-
-    # Парсим конфигурацию СНАЧАЛА
     parse_config_file(CONFIG_FILE)
-
-    # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ИСТОРИИ ---
     init_history_db() # <--- ВЫЗЫВАЕМ ИНИЦИАЛИЗАЦИЮ ТАБЛИЦЫ ИСТОРИИ
-
-    # Инициализируем Gemini
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=BASE_SYSTEM_PROMPT)
