@@ -22,7 +22,7 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
 # --- Настройки и переменные (без изменений) ---
-# ... (все переменные остаются) ...
+# ... (код переменных) ...
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
 logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING)
@@ -30,8 +30,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN"); WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
-DATABASE_URL = os.environ.get("DATABASE_URL")
-CALENDAR_FILE = "calc.txt"
+DATABASE_URL = os.environ.get("DATABASE_URL"); CALENDAR_FILE = "calc.txt"
 MAX_HISTORY_PER_CHAT = 700; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
 GEMINI_MODEL_NAME = "gemini-2.0-flash"
 BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; TOOLS_PROMPT = ""; CHAR_DESCRIPTIONS = {}
@@ -74,41 +73,19 @@ def parse_config_file(filepath: str):
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
 
-
-# --- ИСПРАВЛЕННАЯ Функция инициализации БД истории ---
+# --- Функция инициализации БД истории (без изменений) ---
+# ... (код init_history_db) ...
 def init_history_db():
-    """Инициализирует таблицу и индекс для истории сообщений в PostgreSQL."""
-    # 1. SQL для создания таблицы (ПОЛНОЕ ОПРЕДЕЛЕНИЕ)
-    sql_create_table = """
-    CREATE TABLE IF NOT EXISTS chat_messages (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT NOT NULL,
-        message_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        role TEXT NOT NULL, -- 'user' или 'model'
-        content TEXT NOT NULL
-    );
-    """
-    # 2. SQL для создания индекса (ПОЛНОЕ ОПРЕДЕЛЕНИЕ)
-    sql_create_index = """
-    CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc
-    ON chat_messages (chat_id, message_timestamp DESC);
-    """
+    sql_create_table = """CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, message_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, role TEXT NOT NULL, content TEXT NOT NULL);"""
+    sql_create_index = """CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc ON chat_messages (chat_id, message_timestamp DESC);"""
     try:
         with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                logger.debug("Executing CREATE TABLE IF NOT EXISTS chat_messages...")
-                cur.execute(sql_create_table)
-                logger.debug("Executing CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc...")
-                cur.execute(sql_create_index)
-                conn.commit()
+            with conn.cursor() as cur: logger.debug("Executing CREATE TABLE IF NOT EXISTS chat_messages..."); cur.execute(sql_create_table); logger.debug("Executing CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc..."); cur.execute(sql_create_index); conn.commit()
         logger.info("PostgreSQL table 'chat_messages' and index checked/created.")
-    except psycopg.Error as e:
-        logger.critical(f"CRITICAL: Failed to initialize history DB table/index: {e}", exc_info=True)
-        exit()
+    except psycopg.Error as e: logger.critical(f"CRITICAL: Failed to initialize history DB table/index: {e}", exc_info=True); exit()
 
-# --- Остальные функции (update_chat_history, get_formatted_history, generate_gemini_response, process_chat_after_delay, handle_business_update, button_handler, post_init, __main__) БЕЗ ИЗМЕНЕНИЙ ---
-# Они просто копируются из предыдущего рабочего варианта, где эта ошибка не возникала.
-# ... (код update_chat_history) ...
+# --- Остальные функции (update_chat_history, get_formatted_history, generate_gemini_response, process_chat_after_delay) БЕЗ ИЗМЕНЕНИЙ ---
+# ... (код этих функций) ...
 def update_chat_history(chat_id: int, role: str, text: str):
     if not text or not text.strip(): logger.warning(f"Attempted to add empty message to history for chat {chat_id}. Skipping."); return
     clean_text = text.strip(); sql_insert = "INSERT INTO chat_messages (chat_id, role, content) VALUES (%s, %s, %s);"
@@ -117,7 +94,6 @@ def update_chat_history(chat_id: int, role: str, text: str):
             with conn.cursor() as cur: cur.execute(sql_insert, (chat_id, role, clean_text)); conn.commit()
         logger.debug(f"Saved message to DB for chat {chat_id}. Role: {role}, Text: '{clean_text[:30]}...'")
     except psycopg.Error as e: logger.error(f"Failed to save message to history DB for chat {chat_id}: {e}")
-# ... (код get_formatted_history) ...
 def get_formatted_history(chat_id: int) -> list:
     sql_select = "SELECT role, content FROM chat_messages WHERE chat_id = %s ORDER BY message_timestamp DESC LIMIT %s;"
     gemini_history = []
@@ -128,7 +104,6 @@ def get_formatted_history(chat_id: int) -> list:
         logger.debug(f"Retrieved {len(gemini_history)} history entries from DB for chat {chat_id}.")
         return gemini_history
     except psycopg.Error as e: logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}"); return []
-# ... (код generate_gemini_response) ...
 async def generate_gemini_response(contents: list) -> str | None:
     global gemini_model;
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
@@ -146,7 +121,6 @@ async def generate_gemini_response(contents: list) -> str | None:
         else: logger.warning(f"Gemini returned unexpected structure: {response}")
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
-# ... (код process_chat_after_delay) ...
 async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
     current_history = get_formatted_history(chat_id); initial_contents = []; context_block_text = ""
@@ -193,21 +167,25 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str
     elif gemini_response_raw == "!fetchcalc": logger.error(f"Gemini returned '!fetchcalc' even after providing calendar data for chat {chat_id}.")
     else: logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce (final).")
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
-# ... (код handle_business_update) ...
+
+# --- Основной обработчик бизнес-сообщений ---
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_to_process = None; business_connection_id = None
-    if update.business_message: message_to_process = update.business_message; business_connection_id = message_to_process.business_connection_id; logger.info(f"--- Received Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
-    elif update.edited_business_message: message_to_process = update.edited_business_message; business_connection_id = getattr(message_to_process, 'business_connection_id', None); logger.info(f"--- Received Edited Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
-    else: return
+    message_to_process = update.business_message or update.edited_business_message
+    if not message_to_process: return
+
     chat = message_to_process.chat; sender = message_to_process.from_user; text = message_to_process.text
+    business_connection_id = getattr(message_to_process, 'business_connection_id', None)
     if not text: logger.debug(f"Ignoring non-text business message in chat {chat.id}"); return
+
     chat_id = chat.id; sender_id_str = str(sender.id) if sender else None; sender_name = "Unknown"
     if sender: sender_name = sender.first_name or f"User_{sender_id_str}"
+
     if sender and sender.id == MY_TELEGRAM_ID and text.startswith("/v "):
         transcription = text[3:].strip()
         if transcription:
             logger.info(f"Processing /v command in chat {chat_id}. Transcription: '{transcription[:30]}...'")
-            update_chat_history(chat_id, "user", transcription); logger.info(f"Message with /v command in chat {chat_id} was not deleted (deletion disabled).")
+            update_chat_history(chat_id, "user", transcription)
+            logger.info(f"Message with /v command in chat {chat_id} was not deleted (deletion disabled).")
             fictional_sender_name_for_suggestion = chat.first_name or f"Chat_{chat_id}"; fictional_sender_id_for_description = str(chat_id)
             async def delayed_processing_for_v_command():
                 try:
@@ -223,14 +201,32 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
             logger.info(f"Scheduled response generation for chat {chat_id} after /v command.")
         else: logger.warning(f"Received empty /v command from {MY_TELEGRAM_ID} in chat {chat_id}. Ignoring.")
         return
+
     is_outgoing = sender and sender.id == MY_TELEGRAM_ID
     if is_outgoing:
-        logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}"); update_chat_history(chat_id, "model", text)
-        if chat_id in debounce_tasks: logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message."); try: debounce_tasks[chat_id].cancel(); except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}"); del debounce_tasks[chat_id]
+        logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}")
+        update_chat_history(chat_id, "model", text)
+        # --- ИСПРАВЛЕННЫЙ БЛОК ---
+        if chat_id in debounce_tasks:
+            logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message.")
+            try:
+                debounce_tasks[chat_id].cancel()
+            except Exception as e:
+                logger.error(f"Error cancelling task for chat {chat_id} (on outgoing): {e}")
+            # Удаляем задачу из словаря в любом случае
+            if chat_id in debounce_tasks: # Проверяем еще раз, т.к. отмена асинхронна
+                del debounce_tasks[chat_id]
         return
+        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
-    logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}"); update_chat_history(chat_id, "user", text)
-    if chat_id in debounce_tasks: logger.debug(f"Cancelling previous debounce task for chat {chat_id}"); try: debounce_tasks[chat_id].cancel(); except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
+
+    logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
+    update_chat_history(chat_id, "user", text)
+    if chat_id in debounce_tasks:
+        logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
+        try: debounce_tasks[chat_id].cancel()
+        except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
     logger.info(f"Scheduling new response generation for chat {chat_id} in {DEBOUNCE_DELAY}s")
     async def delayed_processing():
         try:
@@ -239,6 +235,8 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
         except asyncio.CancelledError: logger.info(f"Debounce task for chat {chat_id} was cancelled.")
         except Exception as e: logger.error(f"Error in delayed processing for chat {chat_id}: {e}", exc_info=True)
     task = asyncio.create_task(delayed_processing()); debounce_tasks[chat_id] = task; logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
+
+# --- Обработчик нажатий на кнопку (без изменений) ---
 # ... (код button_handler) ...
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query;
@@ -278,6 +276,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as edit_e: logger.error(f"Failed to edit original suggestion message: {edit_e}")
     except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}' or processing reply for UUID {reply_uuid}: {e}");
     except Exception as e: logger.error(f"Unexpected error in button_handler (UUID {reply_uuid}): {e}", exc_info=True);
+
+# --- Функция post_init (без изменений) ---
 # ... (код post_init) ...
 async def post_init(application: Application):
     webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
@@ -292,11 +292,13 @@ async def post_init(application: Application):
         if webhook_info.url == webhook_full_url: logger.info("Webhook successfully set!")
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
+
+# --- Основная точка входа (без изменений) ---
 # ... (код __main__) ...
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
     parse_config_file(CONFIG_FILE)
-    init_history_db() # <--- ВЫЗЫВАЕМ ИНИЦИАЛИЗАЦИЮ ТАБЛИЦЫ ИСТОРИИ
+    init_history_db()
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=BASE_SYSTEM_PROMPT)
