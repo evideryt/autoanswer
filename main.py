@@ -11,7 +11,7 @@ import psycopg
 from datetime import datetime, timezone
 import pytz
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message # Добавил Message для тайпхинтинга
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message # Добавил Message
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -23,7 +23,7 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
 # --- Настройки и переменные ---
-# ... (все переменные как были, включая GEMINI_MODEL_NAME, MAX_HISTORY_PER_CHAT=700) ...
+# ... (все переменные как были) ...
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
 logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING)
@@ -43,7 +43,6 @@ if MY_TELEGRAM_ID_STR:
     try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
     except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not valid."); exit()
 else: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID."); exit()
-
 
 # --- Функция получения саратовского времени (без изменений) ---
 # ... (код get_saratov_datetime_info) ...
@@ -99,7 +98,7 @@ def update_chat_history(chat_id: int, role: str, text: str):
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur: cur.execute(sql_insert, (chat_id, role, clean_text)); conn.commit()
-        logger.debug(f"Saved message to DB for chat {chat_id}. Role: {role}, Text: '{clean_text[:50]}...'") # Увеличил срез для лога
+        logger.debug(f"Saved message to DB for chat {chat_id}. Role: {role}, Text: '{clean_text[:50]}...'")
     except psycopg.Error as e: logger.error(f"Failed to save message to history DB for chat {chat_id}: {e}")
 def get_formatted_history(chat_id: int) -> list:
     sql_select = "SELECT role, content FROM chat_messages WHERE chat_id = %s ORDER BY message_timestamp DESC LIMIT %s;"
@@ -112,88 +111,48 @@ def get_formatted_history(chat_id: int) -> list:
         return gemini_history
     except psycopg.Error as e: logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}"); return []
 
-# --- НОВАЯ Функция для обогащения текста сообщения ---
+# --- ИСПРАВЛЕННАЯ Функция для обогащения текста сообщения ---
 def enrich_message_for_history(message: Message) -> str:
-    """Формирует обогащенное текстовое представление сообщения для истории."""
     parts = []
-    # Используем message.text_html или message.caption_html для сохранения некоторого форматирования,
-    # но Gemini не принимает HTML, поэтому пока просто message.text / message.caption
-    original_message_text = message.text or "" # Основной текст сообщения
+    original_message_text = message.text or ""
 
-    # 1. Инфо об ответе
     if message.reply_to_message:
         reply_to = message.reply_to_message
         reply_sender_display_name = "собеседнику"
-        if reply_to.from_user:
-            reply_sender_display_name = reply_to.from_user.first_name or reply_to.from_user.full_name or f"User_{reply_to.from_user.id}"
-        elif reply_to.chat and reply_to.chat.title: # Ответ на сообщение из чата/канала
-            reply_sender_display_name = f"сообщению из '{reply_to.chat.title}'"
-        
+        if reply_to.from_user: reply_sender_display_name = reply_to.from_user.first_name or reply_to.from_user.full_name or f"User_{reply_to.from_user.id}"
+        elif reply_to.chat and reply_to.chat.title: reply_sender_display_name = f"сообщению из '{reply_to.chat.title}'"
         replied_message_snippet = (reply_to.text or reply_to.caption or "[медиа/без текста]")[:40].replace('\n', ' ')
         parts.append(f"[В ответ {reply_sender_display_name} на «{replied_message_snippet}...»]")
 
-    # 2. Инфо о пересылке
     fwd_info_str = ""
-    if message.forward_from:
-        fwd_info_str = f"от {message.forward_from.first_name or message.forward_from.full_name or f'User_{message.forward_from.id}'}"
-    elif message.forward_from_chat:
-        fwd_info_str = f"из '{message.forward_from_chat.title or f'Chat_{message.forward_from_chat.id}'}'"
-        if message.forward_from_message_id: # Если есть ID оригинального сообщения в канале
-             fwd_info_str += f" (сообщение {message.forward_from_message_id})"
-    elif message.forward_sender_name: # Для "скрытых" пересылок
-        fwd_info_str = f"от {message.forward_sender_name}"
-    
-    if fwd_info_str:
-        parts.append(f"[Переслано {fwd_info_str}]")
+    forward_from_user = getattr(message, 'forward_from', None)
+    forward_from_chat_obj = getattr(message, 'forward_from_chat', None)
+    forward_sender_name_attr = getattr(message, 'forward_sender_name', None)
 
-    # 3. Обработка медиа и основного текста/подписи
-    media_description = ""
-    # Текст сообщения или подпись к медиа. Подпись приоритетнее, если есть.
-    # Если есть и текст, и медиа с подписью, текст сообщения будет добавлен отдельно.
-    effective_text = message.caption if message.caption else original_message_text
+    if forward_from_user: fwd_info_str = f"от {forward_from_user.first_name or forward_from_user.full_name or f'User_{forward_from_user.id}'}"
+    elif forward_from_chat_obj:
+        fwd_info_str = f"из '{forward_from_chat_obj.title or f'Chat_{forward_from_chat_obj.id}'}'"
+        forward_from_message_id_attr = getattr(message, 'forward_from_message_id', None)
+        if forward_from_message_id_attr: fwd_info_str += f" (сообщение {forward_from_message_id_attr})"
+    elif forward_sender_name_attr: fwd_info_str = f"от {forward_sender_name_attr}"
+    if fwd_info_str: parts.append(f"[Переслано {fwd_info_str}]")
 
-    if message.photo:
-        media_description = "[Фото]"
-        if message.caption: media_description += f" с подписью."
-    elif message.video:
-        media_description = "[Видео]"
-        if message.caption: media_description += f" с подписью."
-    elif message.audio:
-        title = message.audio.title or message.audio.file_name or "аудиофайл"
-        media_description = f"[Аудио: {title}]"
-        if message.caption: media_description += f" с подписью."
-    elif message.voice:
-        media_description = "[Голосовое сообщение]" # Расшифровка будет через /v
-        effective_text = "" # Для ГС основной текст нерелевантен здесь
-    elif message.document:
-        file_name = message.document.file_name or "документ"
-        media_description = f"[Файл: {file_name}]"
-        if message.caption: media_description += f" с подписью."
-    elif message.sticker:
-        sticker_emoji = message.sticker.emoji or ""
-        media_description = f"[Стикер{(' ' + sticker_emoji) if sticker_emoji else ''}]"
-        effective_text = "" # Текста у стикера нет
-    # Добавить другие типы: contact, location, poll, venue, game, video_note, etc.
+    media_description = ""; effective_text = message.caption if message.caption else original_message_text
+    if message.photo: media_description = "[Фото]";
+    elif message.video: media_description = "[Видео]";
+    elif message.audio: title = (getattr(message.audio, 'title', None) or getattr(message.audio, 'file_name', None) or "аудиофайл"); media_description = f"[Аудио: {title}]";
+    elif message.voice: media_description = "[Голосовое сообщение]"; effective_text = ""
+    elif message.document: file_name = getattr(message.document, 'file_name', "документ"); media_description = f"[Файл: {file_name}]";
+    elif message.sticker: sticker_emoji = getattr(message.sticker, 'emoji', ""); media_description = f"[Стикер{(' ' + sticker_emoji) if sticker_emoji else ''}]"; effective_text = ""
+    if message.caption and media_description : media_description += " с подписью." # Уточняем если есть подпись к известному медиа
 
-    if media_description:
-        parts.append(media_description)
-    
-    # 4. Добавляем "эффективный" текст (подпись или основной текст)
+    if media_description: parts.append(media_description)
     if effective_text and effective_text.strip():
-        # Если это был основной текст и уже было добавлено описание медиа,
-        # и этот текст не является подписью, добавляем его.
-        if original_message_text and media_description and not message.caption:
-            parts.append(f"[Текстовое сопровождение к медиа: {original_message_text.strip()}]")
-        elif not (media_description and message.caption): # Добавляем, если это не подпись, которая уже учтена
-             parts.append(effective_text.strip())
-
+        if original_message_text and media_description and not message.caption: parts.append(f"[Текстовое сопровождение к медиа: {original_message_text.strip()}]")
+        elif not (media_description and message.caption): parts.append(effective_text.strip())
 
     final_display_text = " ".join(p.strip() for p in parts if p and p.strip()).strip()
-    
-    if not final_display_text: # Если все еще пусто (например, только ГС без /v)
-        if media_description : return media_description # Хотя бы тип медиа
-        return "[Пустое или нераспознанное сообщение]"
-
+    if not final_display_text: return media_description if media_description else "[Пустое или нераспознанное сообщение]"
     return final_display_text
 
 # --- Функция для вызова Gemini API (без изменений) ---
@@ -216,7 +175,7 @@ async def generate_gemini_response(contents: list) -> str | None:
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
-# --- Функция обработки чата ПОСЛЕ задержки (без изменений в логике, но enrich_message_for_history влияет на current_history) ---
+# --- Функция обработки чата ПОСЛЕ задержки (без изменений) ---
 # ... (код process_chat_after_delay) ...
 async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
@@ -255,6 +214,8 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str
         reply_uuid = str(uuid.uuid4()); pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id); logger.debug(f"Stored final pending reply with UUID {reply_uuid}")
         preview_text = gemini_response_raw.replace("!NEWMSG!", "\n\n🔚\n\n")
         try:
+            logger.info(f"Attempting to send suggestion preview to MY_TELEGRAM_ID: {MY_TELEGRAM_ID} (type: {type(MY_TELEGRAM_ID)})")
+            if MY_TELEGRAM_ID is None: logger.error("CRITICAL: MY_TELEGRAM_ID is None before sending preview! Cannot send."); return
             safe_sender_name = html.escape(sender_name); escaped_preview_text = html.escape(preview_text)
             reply_text_html = (f"🤖 <b>Предложенный ответ для чата {html.escape(str(chat_id))}</b> (<i>{safe_sender_name}</i>):\n"
                                f"──────────────────\n<code>{escaped_preview_text}</code>")
@@ -271,40 +232,29 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     message_to_process = update.business_message or update.edited_business_message
     if not message_to_process: return
 
-    # --- Используем новую функцию для получения обогащенного текста ---
-    enriched_history_text = enrich_message_for_history(message_to_process)
-    # logger.debug(f"Enriched text for history: {enriched_history_text}") # Для отладки
+    enriched_history_text = enrich_message_for_history(message_to_process) # <--- Получаем обогащенный текст
+    # logger.debug(f"Chat {message_to_process.chat_id} | Enriched text: {enriched_history_text}")
 
     chat = message_to_process.chat
     sender = message_to_process.from_user
     business_connection_id = getattr(message_to_process, 'business_connection_id', None)
-    original_text_from_update = message_to_process.text or "" # Оригинальный текст из Telegram
+    original_text_from_update = message_to_process.text or ""
 
     chat_id = chat.id
     sender_id_str = str(sender.id) if sender else None
     sender_name = "Unknown"
     if sender: sender_name = sender.first_name or sender.full_name or f"User_{sender_id_str}"
 
-    # --- Обработка команды /v от тебя ---
     if sender and sender.id == MY_TELEGRAM_ID and original_text_from_update.startswith("/v "):
         transcription = original_text_from_update[3:].strip()
         if transcription:
-            # Формируем обогащенный текст для ГС, как будто его прислал собеседник
-            # ВАЖНО: chat_id здесь - это ID чата, В КОТОРОМ ты написал /v.
-            # Если это ЛС с кем-то, то chat_id - это ID этого "кого-то".
-            # Этот "кто-то" и будет считаться "отправителем" ГС в истории.
-            # `enrich_message_for_history` не вызываем, так как это специфичный случай
             final_voice_text_for_history = f"[Голосовое сообщение от собеседника]: {transcription}"
             logger.info(f"Processing /v command in chat {chat_id}. History text: '{final_voice_text_for_history[:50]}...'")
-            update_chat_history(chat_id, "user", final_voice_text_for_history) # Добавляем как от "user"
+            update_chat_history(chat_id, "user", final_voice_text_for_history)
             logger.info(f"Message with /v command in chat {chat_id} was not deleted (deletion disabled).")
             
-            # Запускаем дебаунс для /v
-            # sender_name и sender_id_str для process_chat_after_delay должны быть данными реального собеседника этого чата
-            # Если chat - это User, то его first_name/id и используем
             interlocutor_name_for_suggestion = chat.first_name or chat.full_name or f"Chat_{chat_id}"
-            interlocutor_id_for_description = str(chat.id) # Для ЛС, chat.id - это ID собеседника
-
+            interlocutor_id_for_description = str(chat.id)
             async def delayed_processing_for_v_command():
                 try:
                     await asyncio.sleep(DEBOUNCE_DELAY)
@@ -312,34 +262,30 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
                     await process_chat_after_delay(chat_id, interlocutor_name_for_suggestion, interlocutor_id_for_description, business_connection_id, context)
                 except asyncio.CancelledError: logger.info(f"Debounce task for /v in chat {chat_id} was cancelled.")
                 except Exception as e: logger.error(f"Error in delayed /v processing for chat {chat_id}: {e}", exc_info=True)
-            
             if chat_id in debounce_tasks:
                 try: debounce_tasks[chat_id].cancel(); logger.debug(f"Cancelled previous debounce for chat {chat_id} due to /v.")
                 except Exception: pass
             task = asyncio.create_task(delayed_processing_for_v_command()); debounce_tasks[chat_id] = task
             logger.info(f"Scheduled response generation for chat {chat_id} after /v command.")
         else: logger.warning(f"Received empty /v command from {MY_TELEGRAM_ID} in chat {chat_id}. Ignoring.")
-        return # Завершаем обработку /v
+        return
 
-    # --- Остальная логика для обычных входящих/исходящих ---
     is_outgoing = sender and sender.id == MY_TELEGRAM_ID
     if is_outgoing:
         logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}")
-        update_chat_history(chat_id, "model", enriched_history_text) # Используем обогащенный текст
-        if chat_id in debounce_tasks: # Отменяем дебаунс, если мы сами ответили
-            logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message.")
-            try: debounce_tasks[chat_id].cancel()
-            except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
-            del debounce_tasks[chat_id]
+        update_chat_history(chat_id, "model", enriched_history_text) # <--- Используем обогащенный текст
+        if chat_id in debounce_tasks:
+             logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message.")
+             try: debounce_tasks[chat_id].cancel()
+             except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
+             del debounce_tasks[chat_id]
         return
 
-    # Это ВХОДЯЩЕЕ от другого пользователя
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
 
     logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
-    update_chat_history(chat_id, "user", enriched_history_text) # Используем обогащенный текст
+    update_chat_history(chat_id, "user", enriched_history_text) # <--- Используем обогащенный текст
     
-    # Запуск/перезапуск дебаунса
     if chat_id in debounce_tasks:
         logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
         try: debounce_tasks[chat_id].cancel()
@@ -396,6 +342,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}' or processing reply for UUID {reply_uuid}: {e}");
     except Exception as e: logger.error(f"Unexpected error in button_handler (UUID {reply_uuid}): {e}", exc_info=True);
 
+
 # --- Функция post_init (без изменений) ---
 # ... (код post_init) ...
 async def post_init(application: Application):
@@ -411,6 +358,7 @@ async def post_init(application: Application):
         if webhook_info.url == webhook_full_url: logger.info("Webhook successfully set!")
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
+
 
 # --- Основная точка входа (без изменений) ---
 # ... (код __main__) ...
