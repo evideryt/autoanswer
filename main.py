@@ -8,20 +8,24 @@ import html
 import time
 import uuid
 import psycopg
-from datetime import datetime
+from datetime import datetime, timezone # <--- timezone добавлен
 import pytz # <--- ДОБАВЛЕНО: для часовых поясов
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-# ... (остальные импорты без изменений) ...
+# ... (остальные импорты telegram.ext без изменений) ...
 from telegram.ext import (
-    Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler,
+    Application,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
 )
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
 
 # --- Настройки и переменные ---
-# ... (все переменные остаются, включая GEMINI_MODEL_NAME = "gemini-2.0-flash") ...
+# ... (все переменные как были, включая GEMINI_MODEL_NAME, MAX_HISTORY_PER_CHAT=700) ...
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
 logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING)
@@ -31,48 +35,35 @@ PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("M
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
 DATABASE_URL = os.environ.get("DATABASE_URL"); CALENDAR_FILE = "calc.txt"
 MAX_HISTORY_PER_CHAT = 700; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
-GEMINI_MODEL_NAME = "gemini-2.0-flash" # <--- УЧТЕНО
+GEMINI_MODEL_NAME = "gemini-2.0-flash"
 BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; TOOLS_PROMPT = ""; CHAR_DESCRIPTIONS = {}
 debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
-# ... (остальные проверки переменных) ...
+# ... (остальные проверки) ...
 if not DATABASE_URL: logger.critical("CRITICAL: Missing DATABASE_URL"); exit()
 
-# --- НОВАЯ Функция для получения даты/времени по Саратову ---
-# Словарь для перевода дней недели на русский
-days_map_ru = {
-    "Monday": "Понедельник", "Tuesday": "Вторник", "Wednesday": "Среда",
-    "Thursday": "Четверг", "Friday": "Пятница", "Saturday": "Суббота", "Sunday": "Воскресенье"
-}
-months_map_ru_genitive = { # Именительный падеж для месяцев
-    "January": "января", "February": "февраля", "March": "марта", "April": "апреля",
-    "May": "мая", "June": "июня", "July": "июля", "August": "августа",
-    "September": "сентября", "October": "октября", "November": "ноября", "December": "декабря"
-}
-
-def get_saratov_datetime_str() -> str:
+# --- НОВОЕ: Функция для получения саратовского времени ---
+def get_saratov_datetime_info():
+    """Возвращает строку с текущей датой, временем и днем недели по Саратову."""
     try:
-        saratov_tz = pytz.timezone('Europe/Saratov') # UTC+4 для Саратова
-        now_saratov = datetime.now(saratov_tz)
+        utc_now = datetime.now(timezone.utc)
+        saratov_tz = pytz.timezone('Europe/Saratov')
+        saratov_now = utc_now.astimezone(saratov_tz)
 
-        day_en = now_saratov.strftime("%A")
-        month_en = now_saratov.strftime("%B") # Полное имя месяца
+        days_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+        day_of_week_ru = days_ru[saratov_now.weekday()]
 
-        day_ru = days_map_ru.get(day_en, day_en)
-        month_ru = months_map_ru_genitive.get(month_en, month_en) # Используем родительный падеж
-
-        # Формат: "Понедельник, 7 мая 2025, 14:30"
-        return f"{day_ru}, {now_saratov.day} {month_ru} {now_saratov.year}, {now_saratov.strftime('%H:%M')}"
+        # Формат: 2023-10-27 15:30 (пятница)
+        return saratov_now.strftime(f"%Y-%m-%d %H:%M ({day_of_week_ru})")
     except Exception as e:
-        logger.error(f"Error getting Saratov datetime: {e}", exc_info=True)
-        now_utc = datetime.utcnow() # Fallback на UTC
-        return f"UTC: {now_utc.strftime('%Y-%m-%d %H:%M')} ({now_utc.strftime('%A')})"
-
+        logger.error(f"Error getting Saratov datetime: {e}")
+        # Возвращаем UTC в случае ошибки, чтобы хоть что-то было
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC (Error getting local time)")
 
 # --- Функция парсинга конфигурационного файла (без изменений) ---
 # ... (код parse_config_file) ...
 def parse_config_file(filepath: str):
-    global BASE_SYSTEM_PROMPT, MY_CHARACTER_DESCRIPTION, TOOLS_PROMPT, CHAR_DESCRIPTIONS; logger.info(f"Attempting to parse config file: {filepath}")
+    global BASE_SYSTEM_PROMPT, MY_CHARACTER_DESCRIPTION,TOOLS_PROMPT, CHAR_DESCRIPTIONS; logger.info(f"Attempting to parse config file: {filepath}")
     try:
         with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
         sections = {}; current_section_name = None; current_section_content = []
@@ -88,12 +79,12 @@ def parse_config_file(filepath: str):
         chars_content = sections.get("CHARS", "")
         if chars_content:
             for char_line in chars_content.splitlines():
-                 if '=' in char_line:
-                     parts = char_line.split('=', 1); user_id_str = parts[0].strip(); description = parts[1].strip()
-                     if user_id_str.isdigit() and description: CHAR_DESCRIPTIONS[user_id_str] = description
-                     else: logger.warning(f"Skipping invalid line in CHARS section: {char_line}")
+                if '=' in char_line:
+                    parts = char_line.split('=', 1); user_id_str = parts[0].strip(); description = parts[1].strip()
+                    if user_id_str.isdigit() and description: CHAR_DESCRIPTIONS[user_id_str] = description
+                    else: logger.warning(f"Skipping invalid line in CHARS section: {char_line}")
         if not BASE_SYSTEM_PROMPT: logger.error(f"CRITICAL: '!!SYSTEM_PROMPT' not found or empty in {filepath}.")
-        if not TOOLS_PROMPT: logger.warning(f"'!!TOOLS' section not found or empty in {filepath}. Calendar fetching might not work.")
+        if not TOOLS_PROMPT: logger.warning(f"'!!TOOLS' section not found or empty in {filepath}.")
         logger.info(f"Config loaded from {filepath}:"); logger.info(f"  SYSTEM_PROMPT: {'Loaded' if BASE_SYSTEM_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  MY_CHARACTER_DESCRIPTION: {'Loaded' if MY_CHARACTER_DESCRIPTION else 'MISSING/EMPTY'}"); logger.info(f"  TOOLS_PROMPT: {'Loaded' if TOOLS_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  Loaded {len(CHAR_DESCRIPTIONS)} character descriptions."); logger.debug(f"PARSED CHAR_DESCRIPTIONS: {CHAR_DESCRIPTIONS}")
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
@@ -102,8 +93,8 @@ def parse_config_file(filepath: str):
 # --- Функции работы с БД истории (без изменений) ---
 # ... (код init_history_db, update_chat_history, get_formatted_history) ...
 def init_history_db():
-    sql_create_table = """CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, message_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, role TEXT NOT NULL, content TEXT NOT NULL);"""
-    sql_create_index = """CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc ON chat_messages (chat_id, message_timestamp DESC);"""
+    sql_create_table = "CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, message_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, role TEXT NOT NULL, content TEXT NOT NULL);"
+    sql_create_index = "CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc ON chat_messages (chat_id, message_timestamp DESC);"
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur: logger.debug("Executing CREATE TABLE IF NOT EXISTS..."); cur.execute(sql_create_table); logger.debug("Executing CREATE INDEX IF NOT EXISTS..."); cur.execute(sql_create_index); conn.commit()
@@ -128,7 +119,6 @@ def get_formatted_history(chat_id: int) -> list:
         return gemini_history
     except psycopg.Error as e: logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}"); return []
 
-
 # --- Функция для вызова Gemini API (без изменений) ---
 # ... (код generate_gemini_response) ...
 async def generate_gemini_response(contents: list) -> str | None:
@@ -149,7 +139,6 @@ async def generate_gemini_response(contents: list) -> str | None:
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
-
 # --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
 async def process_chat_after_delay(
     chat_id: int,
@@ -160,27 +149,22 @@ async def process_chat_after_delay(
 ):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
     current_history = get_formatted_history(chat_id)
-    saratov_time_str = get_saratov_datetime_str() # <--- Получаем время Саратова
+    saratov_time_str = get_saratov_datetime_info() # <--- Получаем саратовское время
 
     # --- Формируем ПЕРВЫЙ промпт (с TOOLS и саратовским временем) ---
-    initial_context_parts = []
-    initial_context_parts.append(f"Текущая информация для контекста: Сейчас в Саратове {saratov_time_str}.")
-
-    interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
-    if interlocutor_description:
-        initial_context_parts.append(f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}")
-    if TOOLS_PROMPT:
-        initial_context_parts.append(f"Инструкции по использованию инструментов:\n{TOOLS_PROMPT}")
-
     initial_contents = []
-    context_block_text_initial = ""
-    if MY_CHARACTER_DESCRIPTION: # Описание Китката
-        context_block_text_initial += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
-    for part in initial_context_parts: # Время, собеседник, тулзы
-        context_block_text_initial += f"{part}\n\n"
+    context_block_text = ""
+    if MY_CHARACTER_DESCRIPTION: context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
+    interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
+    if interlocutor_description: context_block_text += f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
     
-    if context_block_text_initial.strip():
-        initial_contents.append({"role": "model", "parts": [{"text": context_block_text_initial.strip()}]})
+    # --- ДОБАВЛЕНО: Саратовское время в контекст ---
+    context_block_text += f"Текущее время в Саратове (где находится Киткат): {saratov_time_str}\n\n"
+
+    if TOOLS_PROMPT: context_block_text += f"Инструкции по инструментам:\n{TOOLS_PROMPT}\n\n"
+
+    if context_block_text.strip():
+        initial_contents.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
     initial_contents.extend(current_history)
 
     logger.debug("Attempting initial Gemini call...")
@@ -196,36 +180,30 @@ async def process_chat_after_delay(
         except FileNotFoundError: logger.error(f"Calendar file '{CALENDAR_FILE}' not found!")
         except Exception as e: logger.error(f"Error reading calendar file '{CALENDAR_FILE}': {e}")
 
-        # --- Формируем ВТОРОЙ промпт (с календарем и саратовским временем) ---
+        # saratov_time_str уже получен выше, используем его же
         calendar_prompt_contents = []
-        context_block_text_calendar = ""
-        # Сначала описание Китката
-        if MY_CHARACTER_DESCRIPTION:
-             context_block_text_calendar += f"Напомню информацию обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
-        # Потом описание собеседника
-        if interlocutor_description:
-             context_block_text_calendar += f"Напомню информацию о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
-        
-        # Вводная для календаря + само время + календарь
         calendar_intro = (
-            f"Был получен запрос на использование календаря. Предоставляю актуальную информацию.\n"
-            f"Сейчас в Саратове: {saratov_time_str}.\n" # <--- Время Саратова здесь тоже
-            f"Данные календаря:\n------\n{calendar_content}\n------\n"
-            f"Пожалуйста, ответь на изначальный вопрос пользователя, используя эту информацию."
+            f"Для ответа на предыдущий вопрос пользователя требуется информация из его расписания.\n"
+            f"Текущая дата и время в Саратове (где находится пользователь Киткат): {saratov_time_str}\n" # Используем саратовское время
+            f"Вот предоставленное пользователем расписание (содержимое файла {CALENDAR_FILE}):\n------\n{calendar_content}\n------\n"
+            f"Пожалуйста, проанализируй это расписание и текущее время, и ответь на последний вопрос пользователя, следуя основной инструкции и стилю Китката."
         )
-        context_block_text_calendar += f"{calendar_intro}\n\n"
+        context_block_text_for_calendar = "" # Пересобираем контекст без TOOLS
+        if MY_CHARACTER_DESCRIPTION: context_block_text_for_calendar += f"Напомню информацию обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
+        if interlocutor_description: context_block_text_for_calendar += f"Напомню информацию о собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
+        # Добавляем саратовское время и сюда, для полноты контекста второго запроса
+        context_block_text_for_calendar += f"Текущее время в Саратове: {saratov_time_str}\n\n"
 
-        if context_block_text_calendar.strip():
-            calendar_prompt_contents.append({"role": "model", "parts": [{"text": context_block_text_calendar.strip()}]})
-        calendar_prompt_contents.extend(current_history)
+        if context_block_text_for_calendar.strip():
+            calendar_prompt_contents.append({"role": "model", "parts": [{"text": context_block_text_for_calendar.strip()}]})
+        calendar_prompt_contents.append({"role": "user", "parts": [{"text": calendar_intro}]}) # Инструкция по календарю
+        calendar_prompt_contents.extend(current_history) # Та же история
 
         logger.debug("Attempting second Gemini call with calendar info...")
         gemini_response_raw = await generate_gemini_response(calendar_prompt_contents)
+        if not gemini_response_raw: logger.error(f"Second Gemini call (with calendar) failed for chat {chat_id}.")
 
-        if not gemini_response_raw:
-             logger.error(f"Second Gemini call (with calendar) failed for chat {chat_id}.")
-
-    # ... (остальная обработка gemini_response_raw, отправка превью - без изменений) ...
+    # ... (остальная часть функции с обработкой gemini_response_raw, pending_replies, отправкой превью - без изменений) ...
     if gemini_response_raw and gemini_response_raw != "!fetchcalc":
         reply_uuid = str(uuid.uuid4())
         pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id); logger.debug(f"Stored final pending reply with UUID {reply_uuid}")
@@ -247,6 +225,7 @@ async def process_chat_after_delay(
 # --- Основной обработчик бизнес-сообщений (без изменений) ---
 # ... (код handle_business_update) ...
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # logger.info(f"--- Received Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}") # Раскомментируй для отладки
     message_to_process = None; business_connection_id = None
     if update.business_message: message_to_process = update.business_message; business_connection_id = message_to_process.business_connection_id; logger.info(f"--- Received Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
     elif update.edited_business_message: message_to_process = update.edited_business_message; business_connection_id = getattr(message_to_process, 'business_connection_id', None); logger.info(f"--- Received Edited Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
@@ -294,13 +273,13 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
 
     logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
-    update_chat_history(chat_id, "user", text)
-    if chat_id in debounce_tasks:
+    update_chat_history(chat_id, "user", text) # Добавляем входящее от собеседника
+    if chat_id in debounce_tasks: # Отменяем предыдущий таймер
         logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
         try: debounce_tasks[chat_id].cancel()
         except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
     logger.info(f"Scheduling new response generation for chat {chat_id} in {DEBOUNCE_DELAY}s")
-    async def delayed_processing():
+    async def delayed_processing(): # Запускаем новый таймер
         try:
             await asyncio.sleep(DEBOUNCE_DELAY)
             logger.debug(f"Debounce delay finished for chat {chat_id}. Starting processing.")
@@ -309,6 +288,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e: logger.error(f"Error in delayed processing for chat {chat_id}: {e}", exc_info=True)
     task = asyncio.create_task(delayed_processing()); debounce_tasks[chat_id] = task
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
+
 
 # --- Обработчик нажатий на кнопку (без изменений) ---
 # ... (код button_handler) ...
@@ -367,18 +347,15 @@ async def post_init(application: Application):
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-
-# --- Основная точка входа ---
+# --- Основная точка входа (без изменений) ---
+# ... (код __main__) ...
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
-    parse_config_file(CONFIG_FILE)
-    init_history_db()
+    parse_config_file(CONFIG_FILE) # Парсим ADP.txt
+    init_history_db()          # Инициализируем БД истории
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel(
-            GEMINI_MODEL_NAME, # <--- Учтено
-            system_instruction=BASE_SYSTEM_PROMPT
-        )
+        gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=BASE_SYSTEM_PROMPT) # Задаем базовый промпт
         logger.info(f"Gemini model '{gemini_model.model_name}' initialized successfully.")
     except Exception as e: logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
 
