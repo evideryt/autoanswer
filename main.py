@@ -8,11 +8,10 @@ import html
 import time
 import uuid
 import psycopg
-from datetime import datetime, timezone # <--- timezone добавлен
-import pytz # <--- ДОБАВЛЕНО: для часовых поясов
+from datetime import datetime, timezone
+import pytz
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-# ... (остальные импорты telegram.ext без изменений) ...
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -23,42 +22,66 @@ from telegram.ext import (
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
-
 # --- Настройки и переменные ---
-# ... (все переменные как были, включая GEMINI_MODEL_NAME, MAX_HISTORY_PER_CHAT=700) ...
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
 logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-BOT_TOKEN = os.environ.get("BOT_TOKEN"); WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
-DATABASE_URL = os.environ.get("DATABASE_URL"); CALENDAR_FILE = "calc.txt"
-MAX_HISTORY_PER_CHAT = 700; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+PORT = int(os.environ.get("PORT", 8443))
+MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID") # Сначала читаем как строку
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+CONFIG_FILE = "adp.txt"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+CALENDAR_FILE = "calc.txt"
+
+# --- ИНИЦИАЛИЗАЦИЯ MY_TELEGRAM_ID СРАЗУ ---
+MY_TELEGRAM_ID = None # Инициализируем
+if MY_TELEGRAM_ID_STR:
+    try:
+        MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
+    except ValueError:
+        logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not a valid integer. Bot cannot operate.")
+        exit()
+else:
+    logger.critical("CRITICAL: Missing MY_TELEGRAM_ID in environment variables. Bot cannot operate.")
+    exit()
+
+# --- Остальные глобальные переменные ---
+MAX_HISTORY_PER_CHAT = 700
+DEBOUNCE_DELAY = 15
+MY_NAME_FOR_HISTORY = "киткат"
+MESSAGE_SPLIT_DELAY = 0.7
 GEMINI_MODEL_NAME = "gemini-2.0-flash"
-BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; TOOLS_PROMPT = ""; CHAR_DESCRIPTIONS = {}
-debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
+
+BASE_SYSTEM_PROMPT = ""
+MY_CHARACTER_DESCRIPTION = ""
+TOOLS_PROMPT = ""
+CHAR_DESCRIPTIONS = {}
+
+debounce_tasks = {}
+pending_replies = {}
+gemini_model = None
+
+# --- КРИТИЧЕСКИЕ ПРОВЕРКИ ОСТАЛЬНЫХ ПЕРЕМЕННЫХ ---
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
-# ... (остальные проверки) ...
+if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
+if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
+# MY_TELEGRAM_ID уже проверен выше
+if not GEMINI_API_KEY: logger.critical("CRITICAL: Missing GEMINI_API_KEY"); exit()
 if not DATABASE_URL: logger.critical("CRITICAL: Missing DATABASE_URL"); exit()
 
-# --- НОВОЕ: Функция для получения саратовского времени ---
+
+# --- Функция получения саратовского времени (без изменений) ---
+# ... (код get_saratov_datetime_info) ...
 def get_saratov_datetime_info():
-    """Возвращает строку с текущей датой, временем и днем недели по Саратову."""
     try:
-        utc_now = datetime.now(timezone.utc)
-        saratov_tz = pytz.timezone('Europe/Saratov')
-        saratov_now = utc_now.astimezone(saratov_tz)
-
-        days_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-        day_of_week_ru = days_ru[saratov_now.weekday()]
-
-        # Формат: 2023-10-27 15:30 (пятница)
+        utc_now = datetime.now(timezone.utc); saratov_tz = pytz.timezone('Europe/Saratov'); saratov_now = utc_now.astimezone(saratov_tz)
+        days_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]; day_of_week_ru = days_ru[saratov_now.weekday()]
         return saratov_now.strftime(f"%Y-%m-%d %H:%M ({day_of_week_ru})")
-    except Exception as e:
-        logger.error(f"Error getting Saratov datetime: {e}")
-        # Возвращаем UTC в случае ошибки, чтобы хоть что-то было
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC (Error getting local time)")
+    except Exception as e: logger.error(f"Error getting Saratov datetime: {e}"); return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC (Error getting local time)")
 
 # --- Функция парсинга конфигурационного файла (без изменений) ---
 # ... (код parse_config_file) ...
@@ -88,7 +111,6 @@ def parse_config_file(filepath: str):
         logger.info(f"Config loaded from {filepath}:"); logger.info(f"  SYSTEM_PROMPT: {'Loaded' if BASE_SYSTEM_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  MY_CHARACTER_DESCRIPTION: {'Loaded' if MY_CHARACTER_DESCRIPTION else 'MISSING/EMPTY'}"); logger.info(f"  TOOLS_PROMPT: {'Loaded' if TOOLS_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  Loaded {len(CHAR_DESCRIPTIONS)} character descriptions."); logger.debug(f"PARSED CHAR_DESCRIPTIONS: {CHAR_DESCRIPTIONS}")
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
-
 
 # --- Функции работы с БД истории (без изменений) ---
 # ... (код init_history_db, update_chat_history, get_formatted_history) ...
@@ -149,28 +171,23 @@ async def process_chat_after_delay(
 ):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
     current_history = get_formatted_history(chat_id)
-    saratov_time_str = get_saratov_datetime_info() # <--- Получаем саратовское время
+    saratov_time_str = get_saratov_datetime_info()
 
-    # --- Формируем ПЕРВЫЙ промпт (с TOOLS и саратовским временем) ---
     initial_contents = []
     context_block_text = ""
     if MY_CHARACTER_DESCRIPTION: context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
     interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
     if interlocutor_description: context_block_text += f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
-    
-    # --- ДОБАВЛЕНО: Саратовское время в контекст ---
     context_block_text += f"Текущее время в Саратове (где находится Киткат): {saratov_time_str}\n\n"
-
     if TOOLS_PROMPT: context_block_text += f"Инструкции по инструментам:\n{TOOLS_PROMPT}\n\n"
-
-    if context_block_text.strip():
-        initial_contents.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
+    if context_block_text.strip(): initial_contents.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
     initial_contents.extend(current_history)
 
     logger.debug("Attempting initial Gemini call...")
     gemini_response_raw = await generate_gemini_response(initial_contents)
 
     if gemini_response_raw == "!fetchcalc":
+        # ... (логика для !fetchcalc без изменений) ...
         logger.info(f"Received '!fetchcalc' signal for chat {chat_id}. Fetching calendar info...")
         calendar_content = "Информация из календаря недоступна."
         try:
@@ -179,50 +196,58 @@ async def process_chat_after_delay(
             else: logger.info(f"Successfully read calendar file '{CALENDAR_FILE}'.")
         except FileNotFoundError: logger.error(f"Calendar file '{CALENDAR_FILE}' not found!")
         except Exception as e: logger.error(f"Error reading calendar file '{CALENDAR_FILE}': {e}")
-
-        # saratov_time_str уже получен выше, используем его же
         calendar_prompt_contents = []
-        calendar_intro = (
-            f"Для ответа на предыдущий вопрос пользователя требуется информация из его расписания.\n"
-            f"Текущая дата и время в Саратове (где находится пользователь Киткат): {saratov_time_str}\n" # Используем саратовское время
-            f"Вот предоставленное пользователем расписание (содержимое файла {CALENDAR_FILE}):\n------\n{calendar_content}\n------\n"
-            f"Пожалуйста, проанализируй это расписание и текущее время, и ответь на последний вопрос пользователя, следуя основной инструкции и стилю Китката."
-        )
-        context_block_text_for_calendar = "" # Пересобираем контекст без TOOLS
+        calendar_intro = (f"Для ответа на предыдущий вопрос пользователя требуется информация из его расписания.\n"
+                          f"Текущая дата и время в Саратове (где находится пользователь Киткат): {saratov_time_str}\n"
+                          f"Вот предоставленное пользователем расписание (содержимое файла {CALENDAR_FILE}):\n------\n{calendar_content}\n------\n"
+                          f"Пожалуйста, проанализируй это расписание и текущее время, и ответь на последний вопрос пользователя, следуя основной инструкции и стилю Китката.")
+        context_block_text_for_calendar = ""
         if MY_CHARACTER_DESCRIPTION: context_block_text_for_calendar += f"Напомню информацию обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
         if interlocutor_description: context_block_text_for_calendar += f"Напомню информацию о собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
-        # Добавляем саратовское время и сюда, для полноты контекста второго запроса
         context_block_text_for_calendar += f"Текущее время в Саратове: {saratov_time_str}\n\n"
-
-        if context_block_text_for_calendar.strip():
-            calendar_prompt_contents.append({"role": "model", "parts": [{"text": context_block_text_for_calendar.strip()}]})
-        calendar_prompt_contents.append({"role": "user", "parts": [{"text": calendar_intro}]}) # Инструкция по календарю
-        calendar_prompt_contents.extend(current_history) # Та же история
-
+        if context_block_text_for_calendar.strip(): calendar_prompt_contents.append({"role": "model", "parts": [{"text": context_block_text_for_calendar.strip()}]})
+        calendar_prompt_contents.append({"role": "user", "parts": [{"text": calendar_intro}]})
+        calendar_prompt_contents.extend(current_history)
         logger.debug("Attempting second Gemini call with calendar info...")
         gemini_response_raw = await generate_gemini_response(calendar_prompt_contents)
         if not gemini_response_raw: logger.error(f"Second Gemini call (with calendar) failed for chat {chat_id}.")
 
-    # ... (остальная часть функции с обработкой gemini_response_raw, pending_replies, отправкой превью - без изменений) ...
+
     if gemini_response_raw and gemini_response_raw != "!fetchcalc":
         reply_uuid = str(uuid.uuid4())
-        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id); logger.debug(f"Stored final pending reply with UUID {reply_uuid}")
+        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id)
+        logger.debug(f"Stored final pending reply with UUID {reply_uuid}")
         preview_text = gemini_response_raw.replace("!NEWMSG!", "\n\n🔚\n\n")
         try:
+            # --- ДОБАВЛЕН ЛОГ перед отправкой ---
+            logger.info(f"Attempting to send suggestion preview to MY_TELEGRAM_ID: {MY_TELEGRAM_ID} (type: {type(MY_TELEGRAM_ID)})")
+            if MY_TELEGRAM_ID is None: # Дополнительная проверка на всякий случай
+                logger.error("CRITICAL: MY_TELEGRAM_ID is None before sending preview! Cannot send.")
+                return # Прерываем, если ID не установлен
+
             safe_sender_name = html.escape(sender_name); escaped_preview_text = html.escape(preview_text)
             reply_text_html = (f"🤖 <b>Предложенный ответ для чата {html.escape(str(chat_id))}</b> (<i>{safe_sender_name}</i>):\n"
                                f"──────────────────\n<code>{escaped_preview_text}</code>")
             callback_data = f"send_{reply_uuid}";
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить в чат", callback_data=callback_data)]])
-            await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_html, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(
+                chat_id=MY_TELEGRAM_ID, # Используем MY_TELEGRAM_ID
+                text=reply_text_html,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
             logger.info(f"Sent suggestion preview (UUID: {reply_uuid}) for target_chat {chat_id} to {MY_TELEGRAM_ID}")
-        except TelegramError as e: logger.error(f"Failed to send suggestion preview (HTML) to {MY_TELEGRAM_ID}: {e}");
-    elif gemini_response_raw == "!fetchcalc": logger.error(f"Gemini returned '!fetchcalc' even after providing calendar data for chat {chat_id}.")
-    else: logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce (final).")
+        except TelegramError as e:
+            logger.error(f"Failed to send suggestion preview (HTML) to MY_TELEGRAM_ID {MY_TELEGRAM_ID}: {e}", exc_info=True) # Добавил exc_info
+            # ... (fallback) ...
+    elif gemini_response_raw == "!fetchcalc":
+        logger.error(f"Gemini returned '!fetchcalc' even after providing calendar data for chat {chat_id}.")
+    else:
+        logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce (final).")
+
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
-
-# --- Основной обработчик бизнес-сообщений (без изменений) ---
+# --- Остальные функции (handle_business_update, button_handler, post_init, __main__) БЕЗ ИЗМЕНЕНИЙ ---
 # ... (код handle_business_update) ...
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # logger.info(f"--- Received Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}") # Раскомментируй для отладки
@@ -289,8 +314,6 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     task = asyncio.create_task(delayed_processing()); debounce_tasks[chat_id] = task
     logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
-
-# --- Обработчик нажатий на кнопку (без изменений) ---
 # ... (код button_handler) ...
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query;
@@ -331,7 +354,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}' or processing reply for UUID {reply_uuid}: {e}");
     except Exception as e: logger.error(f"Unexpected error in button_handler (UUID {reply_uuid}): {e}", exc_info=True);
 
-# --- Функция post_init (без изменений) ---
 # ... (код post_init) ...
 async def post_init(application: Application):
     webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
@@ -347,7 +369,6 @@ async def post_init(application: Application):
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-# --- Основная точка входа (без изменений) ---
 # ... (код __main__) ...
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
