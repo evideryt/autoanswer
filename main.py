@@ -8,7 +8,8 @@ import html
 import time
 import uuid
 import psycopg
-from datetime import datetime
+from datetime import datetime, timezone
+import pytz
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,31 +22,35 @@ from telegram.ext import (
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
-# --- Настройки и переменные (без изменений) ---
-# ... (код переменных) ...
+# --- Настройки и переменные ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
 logging.getLogger("psycopg").setLevel(logging.WARNING); logging.getLogger("psycopg.pool").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN"); WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8443)); MY_TELEGRAM_ID_STR = os.environ.get("MY_TELEGRAM_ID")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"; DATABASE_URL = os.environ.get("DATABASE_URL")
-CALENDAR_FILE = "calc.txt"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
+DATABASE_URL = os.environ.get("DATABASE_URL"); CALENDAR_FILE = "calc.txt"
+
 MAX_HISTORY_PER_CHAT = 700; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
+GEMINI_MODEL_NAME = "gemini-2.0-flash"; TARGET_TIMEZONE = "Europe/Saratov"
+
 BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; TOOLS_PROMPT = ""; CHAR_DESCRIPTIONS = {}
-debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
-if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit() # и т.д. ...
+chat_histories = {}; debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
+
+# --- КРИТИЧЕСКИЕ ПРОВЕРКИ ПЕРЕМЕННЫХ (без изменений) ---
+if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
 if not WEBHOOK_URL: logger.critical("CRITICAL: Missing WEBHOOK_URL"); exit()
 if not WEBHOOK_URL.startswith("https://"): logger.critical(f"CRITICAL: WEBHOOK_URL must start with 'https://'"); exit()
 if not MY_TELEGRAM_ID_STR: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID"); exit()
 try: MY_TELEGRAM_ID = int(MY_TELEGRAM_ID_STR)
 except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not a valid integer."); exit()
 if not GEMINI_API_KEY: logger.critical("CRITICAL: Missing GEMINI_API_KEY"); exit()
-if not DATABASE_URL: logger.critical("CRITICAL: Missing DATABASE_URL for history storage."); exit()
+if not DATABASE_URL: logger.critical("CRITICAL: Missing DATABASE_URL"); exit()
+
 
 # --- Функция парсинга конфигурационного файла (без изменений) ---
-# ... (код parse_config_file) ...
 def parse_config_file(filepath: str):
     global BASE_SYSTEM_PROMPT, MY_CHARACTER_DESCRIPTION, TOOLS_PROMPT, CHAR_DESCRIPTIONS; logger.info(f"Attempting to parse config file: {filepath}")
     try:
@@ -67,14 +72,13 @@ def parse_config_file(filepath: str):
                     if user_id_str.isdigit() and description: CHAR_DESCRIPTIONS[user_id_str] = description
                     else: logger.warning(f"Skipping invalid line in CHARS section: {char_line}")
         if not BASE_SYSTEM_PROMPT: logger.error(f"CRITICAL: '!!SYSTEM_PROMPT' not found or empty in {filepath}.")
+        if not MY_CHARACTER_DESCRIPTION: logger.warning(f"'!!MC' not found or empty in {filepath}.")
         if not TOOLS_PROMPT: logger.warning(f"'!!TOOLS' section not found or empty in {filepath}.")
         logger.info(f"Config loaded from {filepath}:"); logger.info(f"  SYSTEM_PROMPT: {'Loaded' if BASE_SYSTEM_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  MY_CHARACTER_DESCRIPTION: {'Loaded' if MY_CHARACTER_DESCRIPTION else 'MISSING/EMPTY'}"); logger.info(f"  TOOLS_PROMPT: {'Loaded' if TOOLS_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  Loaded {len(CHAR_DESCRIPTIONS)} character descriptions."); logger.debug(f"PARSED CHAR_DESCRIPTIONS: {CHAR_DESCRIPTIONS}")
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
 
-
 # --- Функции работы с БД истории (без изменений) ---
-# ... (код init_history_db, update_chat_history, get_formatted_history) ...
 def init_history_db():
     sql_create_table = """CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, message_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, role TEXT NOT NULL, content TEXT NOT NULL);"""
     sql_create_index = """CREATE INDEX IF NOT EXISTS idx_chat_id_timestamp_desc ON chat_messages (chat_id, message_timestamp DESC);"""
@@ -102,54 +106,22 @@ def get_formatted_history(chat_id: int) -> list:
         return gemini_history
     except psycopg.Error as e: logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}"); return []
 
-
-# --- ИЗМЕНЕННАЯ Функция для вызова Gemini API ---
-async def generate_gemini_response(dynamic_context_parts: list, chat_history: list) -> str | None:
+# --- Функция для вызова Gemini API (без изменений) ---
+async def generate_gemini_response(contents: list) -> str | None:
     global gemini_model
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
-
-    gemini_contents = []
-    context_block_text = ""
-
-    # --- ДОБАВЛЕНО: Текущая дата и время в контекст ---
-    now = datetime.now()
-    current_datetime_str = now.strftime("%d %B %Y года, %A, время: %H:%M") # Формат "07 мая 2025 года, среда, время: 09:30"
-    # Пробуем установить русскую локаль для названий месяцев и дней недели
+    if not contents: logger.warning("Cannot generate response for empty contents list."); return None
+    try: tz = pytz.timezone(TARGET_TIMEZONE); now_localized = datetime.now(tz)
+    except pytz.exceptions.UnknownTimeZoneError: logger.warning(f"Unknown timezone '{TARGET_TIMEZONE}', using UTC."); now_localized = datetime.now(timezone.utc)
+    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]; months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+    current_datetime_str = (f"сейчас {now_localized.day} {months[now_localized.month-1]}, {days[now_localized.weekday()]}, время: {now_localized.strftime('%H:%M')}")
+    logger.debug(f"Current datetime for prompt: {current_datetime_str}")
+    final_contents = [{"role": "model", "parts": [{"text": f"Системная информация: {current_datetime_str}"}]}]
+    final_contents.extend(contents)
+    logger.info(f"Sending request to Gemini with {len(final_contents)} total content entries (incl. datetime).")
     try:
-        # На Render может не быть нужной локали, это просто попытка
-        # Для Linux часто 'ru_RU.UTF-8', для Windows 'russian'
-        # locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8') # Убрал import locale, т.к. это не очень надежно на серверах
-        # Вместо этого можно передавать названия месяцев/дней явно или использовать библиотеку для локализации
-        # Пока оставим формат, который дает strftime по умолчанию, он будет на английском, если локаль не русская
-        pass # locale.setlocale не очень надежен на серверах без доп.настройки
-    except Exception: # locale.Error
-        logger.warning("Could not set Russian locale for datetime formatting, using default.")
-    context_block_text += f"Текущая дата и время: {current_datetime_str}.\n\n"
-    # --- Конец добавления даты/времени ---
-
-    if MY_CHARACTER_DESCRIPTION:
-        context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
-    for part in dynamic_context_parts: # Это описание собеседника или инструкции про календарь
-        context_block_text += f"{part}\n\n"
-
-    if context_block_text.strip():
-        gemini_contents.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
-        logger.debug(f"Prepended context block to Gemini contents.")
-
-    gemini_contents.extend(chat_history)
-    if not gemini_contents: logger.warning("Cannot generate response for empty Gemini contents."); return None
-
-    logger.info(f"Sending request to Gemini with {len(gemini_contents)} content entries.")
-    # logger.debug(f"Full Gemini Payload (contents): {json.dumps(gemini_contents, ensure_ascii=False, indent=2)}")
-
-    try:
-        response = await gemini_model.generate_content_async(
-            contents=gemini_contents,
-            generation_config=genai.types.GenerationConfig(temperature=0.7),
-            safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-                             'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'}
-        )
-        # ... (обработка ответа Gemini без изменений) ...
+        response = await gemini_model.generate_content_async(contents=final_contents, generation_config=genai.types.GenerationConfig(temperature=0.7),
+            safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HARM_CATEGORY_HATE_SPEECH': 'block_none', 'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'})
         if response and response.parts:
             generated_text = "".join(part.text for part in response.parts).strip()
             if generated_text and "cannot fulfill" not in generated_text.lower() and "unable to process" not in generated_text.lower():
@@ -158,176 +130,128 @@ async def generate_gemini_response(dynamic_context_parts: list, chat_history: li
         elif response and response.prompt_feedback: logger.warning(f"Gemini request blocked: {response.prompt_feedback}")
         else: logger.warning(f"Gemini returned unexpected structure: {response}")
         return None
-    except Exception as e:
-        logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True)
-        return None
+    except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
 # --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
 async def process_chat_after_delay(
-    chat_id: int,
-    sender_name: str,
-    sender_id_str: str,
-    business_connection_id: str | None,
-    context: ContextTypes.DEFAULT_TYPE
+    chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE
 ):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
-    current_history = get_formatted_history(chat_id)
-    dynamic_prompt_parts_for_gemini = [] # Для описаний и инструкций календаря
+    current_history = get_formatted_history(chat_id); context_parts_for_gemini = []
+    context_block_text = ""
+    if MY_CHARACTER_DESCRIPTION: context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
     interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
-    if interlocutor_description:
-        logger.info(f"FOUND description for sender {sender_id_str}")
-        dynamic_prompt_parts_for_gemini.append(f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}")
-    else: logger.warning(f"Description NOT FOUND for sender ID {sender_id_str}")
+    if interlocutor_description: context_block_text += f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
+    if TOOLS_PROMPT: context_block_text += f"Инструкции по инструментам:\n{TOOLS_PROMPT}\n\n"
+    if context_block_text.strip(): context_parts_for_gemini.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
+    logger.debug(f"Passing context_parts_for_gemini to generate_gemini_response: {context_parts_for_gemini}")
+    gemini_response_raw = await generate_gemini_response(context_parts_for_gemini + current_history)
 
-    # --- ПЕРВЫЙ вызов Gemini (с TOOLS) ---
-    first_call_context = list(dynamic_prompt_parts_for_gemini) # Копируем, чтобы не менять исходный
-    if TOOLS_PROMPT:
-        first_call_context.append(f"Инструкции по инструментам:\n{TOOLS_PROMPT}") # Добавляем TOOLS
-
-    logger.debug(f"Attempting initial Gemini call with tools context: {first_call_context}")
-    gemini_response_raw = await generate_gemini_response(first_call_context, current_history)
-
-    # --- Проверяем на !fetchcalc ---
-    if gemini_response_raw == "!fetchcalc":
+    if gemini_response_raw == "!fetchcalc": # Обработка !fetchcalc
         logger.info(f"Received '!fetchcalc' signal for chat {chat_id}. Fetching calendar info...")
-        calendar_content = "Информация из календаря недоступна."; # ... (логика чтения CALENDAR_FILE) ...
+        calendar_content = "Информация из календаря недоступна."
         try:
             with open(CALENDAR_FILE, 'r', encoding='utf-8') as f: calendar_content = f.read().strip()
-            if not calendar_content: logger.warning(f"Calendar file '{CALENDAR_FILE}' is empty."); calendar_content = "Файл календаря пуст."
+            if not calendar_content: calendar_content = "Файл календаря пуст."
             else: logger.info(f"Successfully read calendar file '{CALENDAR_FILE}'.")
         except FileNotFoundError: logger.error(f"Calendar file '{CALENDAR_FILE}' not found!")
         except Exception as e: logger.error(f"Error reading calendar file '{CALENDAR_FILE}': {e}")
+        try: tz = pytz.timezone(TARGET_TIMEZONE); now_localized = datetime.now(tz)
+        except: now_localized = datetime.now(timezone.utc)
+        days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]; months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+        current_datetime_str_for_calendar = (f"сейчас {now_localized.day} {months[now_localized.month-1]}, {days[now_localized.weekday()]}, время: {now_localized.strftime('%H:%M')}")
+        calendar_prompt_contents = []; calendar_prompt_contents.extend(context_parts_for_gemini)
+        calendar_intro = (f"Получен запрос на использование календаря.\nТекущая дата и время: {current_datetime_str_for_calendar}\n"
+                          f"Предоставленное расписание:\n------\n{calendar_content}\n------\n"
+                          f"Пожалуйста, ответь на последний вопрос пользователя, используя эту информацию и следуя основной инструкции.")
+        calendar_prompt_contents.append({"role": "user", "parts": [{"text": calendar_intro}]})
+        calendar_prompt_contents.extend(current_history)
+        logger.debug("Attempting second Gemini call with calendar info...")
+        gemini_response_raw = await generate_gemini_response(calendar_prompt_contents)
 
-        now = datetime.now()
-        current_datetime_str_for_calendar = now.strftime("%d %B %Y года, %A, %H:%M")
-
-        # --- Формируем ВТОРОЙ промпт (с календарем, БЕЗ TOOLS) ---
-        calendar_prompt_context = list(dynamic_prompt_parts_for_gemini) # Описания персонажей
-        calendar_instruction = (
-            f"Получен запрос на использование календаря (предыдущий ответ был '!fetchcalc').\n"
-            f"Текущая дата и время: {current_datetime_str_for_calendar}\n"
-            f"Предоставленное расписание:\n------\n{calendar_content}\n------\n"
-            f"Пожалуйста, ответь на последний вопрос пользователя, используя эту информацию и следуя основной инструкции (без использования '!fetchcalc' снова)."
-        )
-        calendar_prompt_context.append(calendar_instruction) # Добавляем инструкцию по календарю
-
-        logger.debug(f"Attempting second Gemini call with calendar context: {calendar_prompt_context}")
-        gemini_response_raw = await generate_gemini_response(calendar_prompt_context, current_history)
-        if not gemini_response_raw or gemini_response_raw == "!fetchcalc":
-             logger.error(f"Second Gemini call (with calendar) failed or returned !fetchcalc for chat {chat_id}.")
-             # Можно отправить уведомление себе об ошибке
-             # await context.bot.send_message(MY_TELEGRAM_ID, f"⚠️ Ошибка: Gemini вернул !fetchcalc/ошибку после календаря для чата {chat_id}")
-             gemini_response_raw = None # Сбрасываем, чтобы не было кнопки
-
-    # --- Обработка финального ответа ---
-    if gemini_response_raw:
-        reply_uuid = str(uuid.uuid4())
-        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id)
+    if gemini_response_raw and gemini_response_raw != "!fetchcalc":
+        reply_uuid = str(uuid.uuid4()); pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id)
         logger.debug(f"Stored final pending reply with UUID {reply_uuid}")
-
-        # --- ИЗМЕНЕНО: Форматирование превью для дробленых сообщений ---
-        parts_for_preview = gemini_response_raw.split("!NEWMSG!")
-        formatted_preview_parts = []
-        for part in parts_for_preview:
-            stripped_part = part.strip()
-            if stripped_part: # Добавляем только непустые части
-                formatted_preview_parts.append(f"<code>{html.escape(stripped_part)}</code>")
         
-        # Соединяем части с НЕэкранированным разделителем
-        preview_text_html = "🔚<br><br>".join(formatted_preview_parts) # Используем <br> для HTML переноса
-
+        # --- ИСПРАВЛЕНО: Форматирование превью ---
+        message_parts_for_preview = [part.strip() for part in gemini_response_raw.split("!NEWMSG!") if part.strip()]
+        escaped_preview_text = ""
+        if message_parts_for_preview:
+            formatted_html_parts = [f"<code>{html.escape(part)}</code>" for part in message_parts_for_preview]
+            escaped_preview_text = ("\n\n🔚\n\n").join(formatted_html_parts)
+        elif gemini_response_raw: # Если нет !NEWMSG!, но ответ есть
+            escaped_preview_text = f"<code>{html.escape(gemini_response_raw)}</code>"
+        # Если gemini_response_raw пуст, escaped_preview_text останется пустым
+            
         try:
             safe_sender_name = html.escape(sender_name)
             reply_title_html = f"🤖 <b>Предложенный ответ для чата {html.escape(str(chat_id))}</b> (<i>{safe_sender_name}</i>):\n──────────────────\n"
-            full_reply_html = reply_title_html + preview_text_html
-
-            callback_data = f"send_{reply_uuid}";
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить в чат", callback_data=callback_data)]])
-            await context.bot.send_message(
-                chat_id=MY_TELEGRAM_ID, text=full_reply_html, reply_markup=keyboard, parse_mode=ParseMode.HTML
-            )
+            full_reply_html = reply_title_html + escaped_preview_text
+            callback_data = f"send_{reply_uuid}"; keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить в чат", callback_data=callback_data)]])
+            await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=full_reply_html, reply_markup=keyboard, parse_mode=ParseMode.HTML)
             logger.info(f"Sent suggestion preview (UUID: {reply_uuid}) for target_chat {chat_id} to {MY_TELEGRAM_ID}")
         except TelegramError as e:
             logger.error(f"Failed to send suggestion preview (HTML) to {MY_TELEGRAM_ID}: {e}")
-            # ... (fallback на простой текст, если HTML не удался) ...
-            try: # Fallback на простой текст
+            try:
                  plain_preview_text = gemini_response_raw.replace("!NEWMSG!", "\n\n🔚\n\n")
                  reply_text_plain = (f"🤖 Предложенный ответ для чата {chat_id} ({sender_name}):\n"
-                                   f"──────────────────\n{plain_preview_text}\n(Не удалось добавить кнопку отправки)")
-                 await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_plain)
-            except Exception as e2: logger.error(f"Failed to send suggestion preview (plain fallback): {e2}")
-    else:
-        logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce (final).")
-
+                                   f"──────────────────\n{plain_preview_text}\n(Форматирование не удалось. Кнопка может не работать.)")
+                 callback_data_fb = f"send_{reply_uuid}"; keyboard_fb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Отправить (простой текст)", callback_data=callback_data_fb)]])
+                 await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_plain, reply_markup=keyboard_fb, parse_mode=None)
+                 logger.info(f"Sent suggestion preview (plain fallback with button attempt) for chat {chat_id} to {MY_TELEGRAM_ID}")
+            except Exception as e2:
+                logger.error(f"Failed to send suggestion preview (plain fallback) to {MY_TELEGRAM_ID}: {e2}")
+                try: await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=f"Ошибка форматирования ответа для чата {chat_id}. Ответ: {gemini_response_raw}")
+                except Exception as e3: logger.error(f"ULTIMATE FALLBACK FAILED for chat {chat_id}: {e3}")
+    elif gemini_response_raw == "!fetchcalc": logger.error(f"Gemini returned '!fetchcalc' even after calendar data for chat {chat_id}.")
+    else: logger.warning(f"No response generated by Gemini for chat {chat_id} (final).")
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
-
 
 # --- Основной обработчик бизнес-сообщений (без изменений) ---
 # ... (код handle_business_update) ...
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # logger.info(f"--- Received Update ---:\n{json.dumps(update.to_dict(), indent=2, ensure_ascii=False)}") # Раскомментируй для отладки
     message_to_process = None; business_connection_id = None
     if update.business_message: message_to_process = update.business_message; business_connection_id = message_to_process.business_connection_id; logger.info(f"--- Received Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
     elif update.edited_business_message: message_to_process = update.edited_business_message; business_connection_id = getattr(message_to_process, 'business_connection_id', None); logger.info(f"--- Received Edited Business Message (ID: {message_to_process.message_id}, ConnID: {business_connection_id}) ---")
     else: return
-
     chat = message_to_process.chat; sender = message_to_process.from_user; text = message_to_process.text
     if not text: logger.debug(f"Ignoring non-text business message in chat {chat.id}"); return
-
     chat_id = chat.id; sender_id_str = str(sender.id) if sender else None; sender_name = "Unknown"
     if sender: sender_name = sender.first_name or f"User_{sender_id_str}"
-
-    if sender and sender.id == MY_TELEGRAM_ID and text.startswith("/v "): # Обработка /v
+    if sender and sender.id == MY_TELEGRAM_ID and text.startswith("/v "):
         transcription = text[3:].strip()
         if transcription:
             logger.info(f"Processing /v command in chat {chat_id}. Transcription: '{transcription[:30]}...'")
-            update_chat_history(chat_id, "user", transcription)
-            logger.info(f"Message with /v command in chat {chat_id} was not deleted (deletion disabled).")
+            update_chat_history(chat_id, "user", transcription); logger.info(f"Message with /v command in chat {chat_id} was not deleted (deletion disabled).")
             fictional_sender_name_for_suggestion = chat.first_name or f"Chat_{chat_id}"; fictional_sender_id_for_description = str(chat_id)
             async def delayed_processing_for_v_command():
                 try:
-                    await asyncio.sleep(DEBOUNCE_DELAY)
-                    logger.debug(f"Debounce for /v in chat {chat_id} finished. Starting processing.")
+                    await asyncio.sleep(DEBOUNCE_DELAY); logger.debug(f"Debounce for /v in chat {chat_id} finished. Starting processing.")
                     await process_chat_after_delay(chat_id, fictional_sender_name_for_suggestion, fictional_sender_id_for_description, business_connection_id, context)
                 except asyncio.CancelledError: logger.info(f"Debounce task for /v in chat {chat_id} was cancelled.")
                 except Exception as e: logger.error(f"Error in delayed /v processing for chat {chat_id}: {e}", exc_info=True)
             if chat_id in debounce_tasks:
                 try: debounce_tasks[chat_id].cancel()
                 except Exception: pass
-            task = asyncio.create_task(delayed_processing_for_v_command()); debounce_tasks[chat_id] = task
-            logger.info(f"Scheduled response generation for chat {chat_id} after /v command.")
+            task = asyncio.create_task(delayed_processing_for_v_command()); debounce_tasks[chat_id] = task; logger.info(f"Scheduled response generation for chat {chat_id} after /v command.")
         else: logger.warning(f"Received empty /v command from {MY_TELEGRAM_ID} in chat {chat_id}. Ignoring.")
         return
-
     is_outgoing = sender and sender.id == MY_TELEGRAM_ID
     if is_outgoing:
-        logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}")
-        update_chat_history(chat_id, "model", text)
-        if chat_id in debounce_tasks:
-             logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message.")
-             try: debounce_tasks[chat_id].cancel()
-             except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
-             del debounce_tasks[chat_id]
+        logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}"); update_chat_history(chat_id, "model", text)
+        if chat_id in debounce_tasks: logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message."); try: debounce_tasks[chat_id].cancel(); except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}"); del debounce_tasks[chat_id]
         return
-
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
-
-    logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
-    update_chat_history(chat_id, "user", text)
-    if chat_id in debounce_tasks:
-        logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
-        try: debounce_tasks[chat_id].cancel()
-        except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
+    logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}"); update_chat_history(chat_id, "user", text)
+    if chat_id in debounce_tasks: logger.debug(f"Cancelling previous debounce task for chat {chat_id}"); try: debounce_tasks[chat_id].cancel(); except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
     logger.info(f"Scheduling new response generation for chat {chat_id} in {DEBOUNCE_DELAY}s")
     async def delayed_processing():
         try:
-            await asyncio.sleep(DEBOUNCE_DELAY)
-            logger.debug(f"Debounce delay finished for chat {chat_id}. Starting processing.")
+            await asyncio.sleep(DEBOUNCE_DELAY); logger.debug(f"Debounce delay finished for chat {chat_id}. Starting processing.")
             await process_chat_after_delay(chat_id, sender_name, sender_id_str, business_connection_id, context)
         except asyncio.CancelledError: logger.info(f"Debounce task for chat {chat_id} was cancelled.")
         except Exception as e: logger.error(f"Error in delayed processing for chat {chat_id}: {e}", exc_info=True)
-    task = asyncio.create_task(delayed_processing()); debounce_tasks[chat_id] = task
-    logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
+    task = asyncio.create_task(delayed_processing()); debounce_tasks[chat_id] = task; logger.debug(f"Scheduled task {task.get_name()} for chat {chat_id}")
 
 # --- Обработчик нажатий на кнопку (без изменений) ---
 # ... (код button_handler) ...
@@ -386,21 +310,22 @@ async def post_init(application: Application):
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
 
-
-# --- Основная точка входа (без изменений) ---
-# ... (код __main__) ...
+# --- Основная точка входа ---
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
-    parse_config_file(CONFIG_FILE); init_history_db()
+    parse_config_file(CONFIG_FILE)
+    init_history_db()
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=BASE_SYSTEM_PROMPT)
         logger.info(f"Gemini model '{gemini_model.model_name}' initialized successfully.")
     except Exception as e: logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
+
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     application.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_update))
     application.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, handle_business_update))
     application.add_handler(CallbackQueryHandler(button_handler))
+
     logger.info("Application built. Starting webhook listener...")
     try:
         webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
