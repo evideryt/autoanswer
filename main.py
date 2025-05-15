@@ -10,8 +10,9 @@ import uuid
 import psycopg
 from datetime import datetime, timezone
 import pytz
+import re # <--- ДОБАВЛЕНО: для регулярных выражений
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message # Убедимся, что Message импортирован
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -44,6 +45,65 @@ if MY_TELEGRAM_ID_STR:
     except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not valid."); exit()
 else: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID."); exit()
 
+
+# --- НОВАЯ Функция для "очистки" ответа Gemini ---
+def sanitize_gemini_response(text: str) -> str:
+    """Удаляет служебные meta_ теги из ответа Gemini."""
+    if not text:
+        return ""
+    # Удаляем паттерны вида "meta_ключ: значение_в_скобках (если есть) и_даже_с_кавычками «...»"
+    # Это регулярное выражение ищет "meta_" за которым следуют не-пробельные символы (ключ),
+    # затем двоеточие, а затем любые символы до конца строки ИЛИ до следующего meta_ (если они в одной строке, хотя не должны)
+    # или до явного текстового ответа.
+    # Более простой подход: удалить все, что похоже на meta_reply_to, meta_forwarded_from, meta_content_type и т.д.
+    # до первого "нормального" слова или до конца строки, если после meta_ ничего нет.
+
+    # Паттерн для удаления: "meta_" + ключ + ":" + все до конца строки или до осмысленного текста.
+    # Это может быть сложно сделать идеально одной регуляркой для всех случаев.
+    # Попробуем удалить известные нам маркеры и их типичные продолжения.
+    
+    # Сначала удаляем общие паттерны meta_...
+    # Этот паттерн удалит "meta_что_угодно: все до конца строки" или "meta_что_угодно: все до (текст_ответа..."
+    # или "meta_что_угодно: все до «текст...»"
+    # Важно: это может быть слишком агрессивно, если Gemini генерирует что-то похожее.
+    
+    # Паттерн для удаления meta-тегов и всего, что за ними до фактического ответа.
+    # Ищем "meta_" + ключ + двоеточие + опциональный пробел + (опционально текст в скобках) + опциональный пробел
+    # И заменяем это на пустую строку.
+    
+    # Более простой и, возможно, более безопасный подход: удаляем конкретные известные префиксы.
+    # Этот паттерн пытается удалить строку, начинающуюся с meta_ и идущую до предполагаемого начала ответа
+    # или до конца, если ответа нет.
+    
+    # 1. Удаляем "meta_reply_to: Имя (текст_ответа_начинался_с: «...»)" и следующий за ним пробел
+    text = re.sub(r"meta_reply_to:\s*[\w\d_()«»\s.:-]+?\s+", "", text, flags=re.IGNORECASE)
+    # 2. Удаляем другие meta_ теги, если они в начале строки ответа
+    text = re.sub(r"^\s*meta_[\w_]+:.*?(?=\w{3,}|$)", "", text, flags=re.IGNORECASE).strip() # Удаляет meta_ в начале до первого слова из 3+ букв или до конца
+    text = re.sub(r"meta_[\w_]+:\s*[\w\d_().,;:\"'«»<>?!#@$%^&*\-+=/\s]+?(?=\s*\w{2,}|$)", "", text).strip()
+
+
+    # Еще одна попытка удалить паттерны, которые могут остаться:
+    # Удаляем "meta_ключ: значение" и пробелы вокруг
+    text = re.sub(r"meta_[\w-]+:\s*[^ ]+\s*", "", text).strip()
+    # Удаляем одиноко стоящие meta_ключи, если они как-то просочились
+    text = re.sub(r"\s*meta_[\w-]+\s*", " ", text).strip()
+    
+    # Простая очистка, если Gemini вернул только meta_теги (маловероятно, но все же)
+    if text.lower().startswith("meta_"):
+        logger.warning(f"Sanitizer: Gemini response started with meta_ and might be fully removed. Original: '{text[:100]}'")
+        # Пытаемся найти первое "осмысленное" слово после всех meta
+        match = re.search(r"(?:meta_[\w\s:().,«»\"'-]+)+(.+)", text, re.IGNORECASE)
+        if match and match.group(1).strip():
+            text = match.group(1).strip()
+            logger.info(f"Sanitizer: Extracted text after meta_: '{text[:100]}'")
+        else:
+            return "" # Если ничего кроме meta_ не осталось
+
+    # Убираем лишние пробелы, которые могли остаться после замен
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    
+    logger.debug(f"Sanitized Gemini response: '{text[:100]}...'")
+    return text
 
 # --- Функция получения саратовского времени (без изменений) ---
 # ... (код get_saratov_datetime_info) ...
@@ -83,6 +143,7 @@ def parse_config_file(filepath: str):
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
 
+
 # --- Функции работы с БД истории (без изменений) ---
 # ... (код init_history_db, update_chat_history, get_formatted_history) ...
 def init_history_db():
@@ -112,18 +173,17 @@ def get_formatted_history(chat_id: int) -> list:
         return gemini_history
     except psycopg.Error as e: logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}"); return []
 
-# --- ИСПРАВЛЕННАЯ Функция для обогащения текста сообщения ---
-def enrich_message_for_history(message: Message) -> str:
-    meta_parts = [] 
-    text_parts = []   
 
+# --- Функция enrich_message_for_history (без изменений, мы ее уже обновили) ---
+# ... (код enrich_message_for_history) ...
+def enrich_message_for_history(message: Message) -> str:
+    meta_parts = [] ; text_parts = []   
     if message.reply_to_message:
         reply_to = message.reply_to_message; reply_sender_display_name = "собеседнику"
         if reply_to.from_user: reply_sender_display_name = reply_to.from_user.first_name or reply_to.from_user.full_name or f"User_{reply_to.from_user.id}"
         elif reply_to.chat and reply_to.chat.title: reply_sender_display_name = f"сообщению_из_чата_{reply_to.chat.title.replace(' ', '_')}"
         replied_message_snippet = (reply_to.text or reply_to.caption or "медиа_без_текста")[:30].replace('\n', ' ').replace(':', ';')
         meta_parts.append(f"meta_reply_to: {reply_sender_display_name} (текст_ответа_начинался_с: «{replied_message_snippet}»)")
-
     fwd_info_str = ""
     forward_from_user = getattr(message, 'forward_from', None); forward_from_chat_obj = getattr(message, 'forward_from_chat', None)
     forward_sender_name_attr = getattr(message, 'forward_sender_name', None)
@@ -134,7 +194,6 @@ def enrich_message_for_history(message: Message) -> str:
         if forward_from_message_id_attr: fwd_info_str += f"_msg_id_{forward_from_message_id_attr}"
     elif forward_sender_name_attr: fwd_info_str = f"hidden_sender_({forward_sender_name_attr.replace(' ', '_')})"
     if fwd_info_str: meta_parts.append(f"meta_forwarded_from: {fwd_info_str}")
-
     media_type_str = None; media_details_str = None
     if message.photo: media_type_str = "photo"
     elif message.video: media_type_str = "video"
@@ -142,26 +201,21 @@ def enrich_message_for_history(message: Message) -> str:
     elif message.voice: media_type_str = "voice_message"
     elif message.document: media_type_str = "document"; media_details_str = getattr(message.document, 'file_name', None)
     elif message.sticker: media_type_str = "sticker"; media_details_str = getattr(message.sticker, 'emoji', None)
-    
     if media_type_str:
         meta_parts.append(f"meta_content_type: {media_type_str}")
         if media_details_str: meta_parts.append(f"meta_media_details: {media_details_str.replace(':',';').replace(' ', '_')[:50]}")
-
     if message.caption: meta_parts.append(f"meta_caption: true"); text_parts.append(message.caption.strip())
     elif message.text: text_parts.append(message.text.strip())
-
     final_parts_for_history = []
     if meta_parts: final_parts_for_history.append(" ".join(meta_parts))
     if text_parts: final_parts_for_history.append(" ".join(text_parts))
     result_text = " ".join(final_parts_for_history).strip()
-
     if not result_text:
         if media_type_str: return f"meta_content_type: {media_type_str} (без_текста_или_подписи)"
         return "meta_info: [пустое_или_нераспознанное_сообщение]"
     return result_text
 
-# --- Остальные функции и хендлеры (generate_gemini_response, process_chat_after_delay, handle_business_update, button_handler, post_init, __main__) БЕЗ ИЗМЕНЕНИЙ ---
-# ... (код этих функций остается таким же, как в твоем предыдущем сообщении) ...
+# --- Функция для вызова Gemini API (без изменений) ---
 # ... (код generate_gemini_response) ...
 async def generate_gemini_response(contents: list) -> str | None:
     global gemini_model;
@@ -181,19 +235,39 @@ async def generate_gemini_response(contents: list) -> str | None:
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
-# ... (код process_chat_after_delay) ...
-async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str: str, business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE):
+# --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
+async def process_chat_after_delay(
+    chat_id: int,
+    sender_name: str,
+    sender_id_str: str,
+    business_connection_id: str | None,
+    context: ContextTypes.DEFAULT_TYPE
+):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
-    current_history = get_formatted_history(chat_id); saratov_time_str = get_saratov_datetime_info(); initial_contents = []; context_block_text = ""
+    current_history = get_formatted_history(chat_id)
+    saratov_time_str = get_saratov_datetime_info()
+
+    initial_contents = []
+    context_block_text = ""
     if MY_CHARACTER_DESCRIPTION: context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
     interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
     if interlocutor_description: context_block_text += f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
     context_block_text += f"Текущее время в Саратове (где находится Киткат): {saratov_time_str}\n\n"
     if TOOLS_PROMPT: context_block_text += f"Инструкции по инструментам:\n{TOOLS_PROMPT}\n\n"
     if context_block_text.strip(): initial_contents.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
-    initial_contents.extend(current_history); logger.debug("Attempting initial Gemini call...")
-    gemini_response_raw = await generate_gemini_response(initial_contents)
+    initial_contents.extend(current_history)
+
+    logger.debug("Attempting initial Gemini call...")
+    gemini_response_from_api = await generate_gemini_response(initial_contents) # Ответ от API
+
+    # --- ОЧИСТКА ответа перед дальнейшей обработкой ---
+    gemini_response_raw = sanitize_gemini_response(gemini_response_from_api) if gemini_response_from_api else None
+    if gemini_response_from_api and not gemini_response_raw:
+        logger.warning(f"Sanitizer possibly removed the entire Gemini response. Original: '{gemini_response_from_api[:100]}'")
+
+
     if gemini_response_raw == "!fetchcalc":
+        # ... (логика для !fetchcalc) ...
         logger.info(f"Received '!fetchcalc' signal for chat {chat_id}. Fetching calendar info...")
         calendar_content = "Информация из календаря недоступна."
         try:
@@ -213,11 +287,20 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str
         if context_block_text_for_calendar.strip(): calendar_prompt_contents.append({"role": "model", "parts": [{"text": context_block_text_for_calendar.strip()}]})
         calendar_prompt_contents.append({"role": "user", "parts": [{"text": calendar_intro}]}); calendar_prompt_contents.extend(current_history)
         logger.debug("Attempting second Gemini call with calendar info...")
-        gemini_response_raw = await generate_gemini_response(calendar_prompt_contents)
-        if not gemini_response_raw: logger.error(f"Second Gemini call (with calendar) failed for chat {chat_id}.")
+        gemini_response_from_api_calendar = await generate_gemini_response(calendar_prompt_contents)
+        # --- ОЧИСТКА второго ответа ---
+        gemini_response_raw = sanitize_gemini_response(gemini_response_from_api_calendar) if gemini_response_from_api_calendar else None
+        if gemini_response_from_api_calendar and not gemini_response_raw:
+             logger.warning(f"Sanitizer possibly removed the entire Gemini response (calendar). Original: '{gemini_response_from_api_calendar[:100]}'")
+        if not gemini_response_raw: logger.error(f"Second Gemini call (with calendar) failed or was sanitized to empty for chat {chat_id}.")
+
+
     if gemini_response_raw and gemini_response_raw != "!fetchcalc":
-        reply_uuid = str(uuid.uuid4()); pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id); logger.debug(f"Stored final pending reply with UUID {reply_uuid}")
+        reply_uuid = str(uuid.uuid4())
+        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id) # Сохраняем УЖЕ ОЧИЩЕННЫЙ
+        logger.debug(f"Stored final SANITIZED pending reply with UUID {reply_uuid}")
         preview_text = gemini_response_raw.replace("!NEWMSG!", "\n\n🔚\n\n")
+        # ... (отправка превью как было) ...
         try:
             logger.info(f"Attempting to send suggestion preview to MY_TELEGRAM_ID: {MY_TELEGRAM_ID} (type: {type(MY_TELEGRAM_ID)})")
             if MY_TELEGRAM_ID is None: logger.error("CRITICAL: MY_TELEGRAM_ID is None before sending preview! Cannot send."); return
@@ -228,25 +311,26 @@ async def process_chat_after_delay(chat_id: int, sender_name: str, sender_id_str
             await context.bot.send_message(chat_id=MY_TELEGRAM_ID, text=reply_text_html, reply_markup=keyboard, parse_mode=ParseMode.HTML)
             logger.info(f"Sent suggestion preview (UUID: {reply_uuid}) for target_chat {chat_id} to {MY_TELEGRAM_ID}")
         except TelegramError as e: logger.error(f"Failed to send suggestion preview (HTML) to MY_TELEGRAM_ID {MY_TELEGRAM_ID}: {e}", exc_info=True);
-    elif gemini_response_raw == "!fetchcalc": logger.error(f"Gemini returned '!fetchcalc' even after providing calendar data for chat {chat_id}.")
-    else: logger.warning(f"No response generated by Gemini for chat {chat_id} after debounce (final).")
+    elif gemini_response_raw == "!fetchcalc":
+        logger.error(f"Gemini returned '!fetchcalc' even after providing calendar data for chat {chat_id} (or it was sanitized to it).")
+    else:
+        logger.warning(f"No response generated or response was sanitized to empty by Gemini for chat {chat_id} after debounce (final).")
+
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
-# ... (код handle_business_update, но он вызывает ИСПРАВЛЕННУЮ enrich_message_for_history) ...
+
+# --- Остальные функции (handle_business_update, button_handler, post_init, __main__) БЕЗ ИЗМЕНЕНИЙ ---
+# ... (код handle_business_update) ...
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_to_process = update.business_message or update.edited_business_message
     if not message_to_process: return
-
-    enriched_history_text = enrich_message_for_history(message_to_process) # <--- Получаем обогащенный текст
-    logger.debug(f"Chat {message_to_process.chat.id} | Enriched: '{enriched_history_text[:100]}...'") # Увеличил срез для лога
-
+    enriched_history_text = enrich_message_for_history(message_to_process)
+    logger.debug(f"Chat {message_to_process.chat.id} | Enriched: '{enriched_history_text[:100]}...'")
     chat = message_to_process.chat; sender = message_to_process.from_user
     business_connection_id = getattr(message_to_process, 'business_connection_id', None)
     original_text_from_update = message_to_process.text or ""
-
     chat_id = chat.id; sender_id_str = str(sender.id) if sender else None; sender_name = "Unknown"
     if sender: sender_name = sender.first_name or sender.full_name or f"User_{sender_id_str}"
-
     if sender and sender.id == MY_TELEGRAM_ID and original_text_from_update.startswith("/v "):
         transcription = original_text_from_update[3:].strip()
         if transcription:
@@ -254,8 +338,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
             logger.info(f"Processing /v command in chat {chat_id}. History text: '{final_voice_text_for_history[:50]}...'")
             update_chat_history(chat_id, "user", final_voice_text_for_history)
             logger.info(f"Message with /v command in chat {chat_id} was not deleted (deletion disabled).")
-            interlocutor_name_for_suggestion = chat.first_name or chat.full_name or f"Chat_{chat_id}"
-            interlocutor_id_for_description = str(chat.id)
+            interlocutor_name_for_suggestion = chat.first_name or chat.full_name or f"Chat_{chat_id}"; interlocutor_id_for_description = str(chat.id)
             async def delayed_processing_for_v_command():
                 try:
                     await asyncio.sleep(DEBOUNCE_DELAY)
@@ -270,7 +353,6 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
             logger.info(f"Scheduled response generation for chat {chat_id} after /v command.")
         else: logger.warning(f"Received empty /v command from {MY_TELEGRAM_ID} in chat {chat_id}. Ignoring.")
         return
-
     is_outgoing = sender and sender.id == MY_TELEGRAM_ID
     if is_outgoing:
         logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}")
@@ -282,12 +364,9 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
              except Exception as e: logger.error(f"Error cancelling task for chat {chat_id}: {e}")
              del debounce_tasks[chat_id]
         return
-
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
-
     logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
     update_chat_history(chat_id, "user", enriched_history_text)
-    
     if chat_id in debounce_tasks:
         logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
         try: debounce_tasks[chat_id].cancel()
