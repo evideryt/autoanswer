@@ -10,7 +10,7 @@ import uuid
 import psycopg
 from datetime import datetime, timezone
 import pytz
-import re
+import re # <--- ДОБАВЛЕНО: для регулярных выражений
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import (
@@ -23,7 +23,7 @@ from telegram.ext import (
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, Forbidden, BadRequest
 
-# --- Настройки и переменные ---
+# --- Настройки и переменные (без изменений) ---
 # ... (все переменные как были) ...
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING); logging.getLogger("google.generativeai").setLevel(logging.INFO)
@@ -35,9 +35,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY"); CONFIG_FILE = "adp.txt"
 DATABASE_URL = os.environ.get("DATABASE_URL"); CALENDAR_FILE = "calc.txt"
 MAX_HISTORY_PER_CHAT = 700; DEBOUNCE_DELAY = 15; MY_NAME_FOR_HISTORY = "киткат"; MESSAGE_SPLIT_DELAY = 0.7
 GEMINI_MODEL_NAME = "gemini-2.0-flash"
-
-META_CONTEXT_END_MARKER = "###END_META_CONTEXT###" # <--- НАШ РАЗДЕЛИТЕЛЬ
-
 BASE_SYSTEM_PROMPT = ""; MY_CHARACTER_DESCRIPTION = ""; TOOLS_PROMPT = ""; CHAR_DESCRIPTIONS = {}
 debounce_tasks = {}; pending_replies = {}; gemini_model = None; MY_TELEGRAM_ID = None
 if not BOT_TOKEN: logger.critical("CRITICAL: Missing BOT_TOKEN"); exit()
@@ -48,6 +45,65 @@ if MY_TELEGRAM_ID_STR:
     except ValueError: logger.critical(f"CRITICAL: MY_TELEGRAM_ID ('{MY_TELEGRAM_ID_STR}') is not valid."); exit()
 else: logger.critical("CRITICAL: Missing MY_TELEGRAM_ID."); exit()
 
+
+# --- НОВАЯ Функция для "очистки" ответа Gemini ---
+def sanitize_gemini_response(text: str) -> str:
+    """Удаляет служебные meta_ теги из ответа Gemini."""
+    if not text:
+        return ""
+    # Удаляем паттерны вида "meta_ключ: значение_в_скобках (если есть) и_даже_с_кавычками «...»"
+    # Это регулярное выражение ищет "meta_" за которым следуют не-пробельные символы (ключ),
+    # затем двоеточие, а затем любые символы до конца строки ИЛИ до следующего meta_ (если они в одной строке, хотя не должны)
+    # или до явного текстового ответа.
+    # Более простой подход: удалить все, что похоже на meta_reply_to, meta_forwarded_from, meta_content_type и т.д.
+    # до первого "нормального" слова или до конца строки, если после meta_ ничего нет.
+
+    # Паттерн для удаления: "meta_" + ключ + ":" + все до конца строки или до осмысленного текста.
+    # Это может быть сложно сделать идеально одной регуляркой для всех случаев.
+    # Попробуем удалить известные нам маркеры и их типичные продолжения.
+    
+    # Сначала удаляем общие паттерны meta_...
+    # Этот паттерн удалит "meta_что_угодно: все до конца строки" или "meta_что_угодно: все до (текст_ответа..."
+    # или "meta_что_угодно: все до «текст...»"
+    # Важно: это может быть слишком агрессивно, если Gemini генерирует что-то похожее.
+    
+    # Паттерн для удаления meta-тегов и всего, что за ними до фактического ответа.
+    # Ищем "meta_" + ключ + двоеточие + опциональный пробел + (опционально текст в скобках) + опциональный пробел
+    # И заменяем это на пустую строку.
+    
+    # Более простой и, возможно, более безопасный подход: удаляем конкретные известные префиксы.
+    # Этот паттерн пытается удалить строку, начинающуюся с meta_ и идущую до предполагаемого начала ответа
+    # или до конца, если ответа нет.
+    
+    # 1. Удаляем "meta_reply_to: Имя (текст_ответа_начинался_с: «...»)" и следующий за ним пробел
+    text = re.sub(r"meta_reply_to:\s*[\w\d_()«»\s.:-]+?\s+", "", text, flags=re.IGNORECASE)
+    # 2. Удаляем другие meta_ теги, если они в начале строки ответа
+    text = re.sub(r"^\s*meta_[\w_]+:.*?(?=\w{3,}|$)", "", text, flags=re.IGNORECASE).strip() # Удаляет meta_ в начале до первого слова из 3+ букв или до конца
+    text = re.sub(r"meta_[\w_]+:\s*[\w\d_().,;:\"'«»<>?!#@$%^&*\-+=/\s]+?(?=\s*\w{2,}|$)", "", text).strip()
+
+
+    # Еще одна попытка удалить паттерны, которые могут остаться:
+    # Удаляем "meta_ключ: значение" и пробелы вокруг
+    text = re.sub(r"meta_[\w-]+:\s*[^ ]+\s*", "", text).strip()
+    # Удаляем одиноко стоящие meta_ключи, если они как-то просочились
+    text = re.sub(r"\s*meta_[\w-]+\s*", " ", text).strip()
+    
+    # Простая очистка, если Gemini вернул только meta_теги (маловероятно, но все же)
+    if text.lower().startswith("meta_"):
+        logger.warning(f"Sanitizer: Gemini response started with meta_ and might be fully removed. Original: '{text[:100]}'")
+        # Пытаемся найти первое "осмысленное" слово после всех meta
+        match = re.search(r"(?:meta_[\w\s:().,«»\"'-]+)+(.+)", text, re.IGNORECASE)
+        if match and match.group(1).strip():
+            text = match.group(1).strip()
+            logger.info(f"Sanitizer: Extracted text after meta_: '{text[:100]}'")
+        else:
+            return "" # Если ничего кроме meta_ не осталось
+
+    # Убираем лишние пробелы, которые могли остаться после замен
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    
+    logger.debug(f"Sanitized Gemini response: '{text[:100]}...'")
+    return text
 
 # --- Функция получения саратовского времени (без изменений) ---
 # ... (код get_saratov_datetime_info) ...
@@ -82,11 +138,11 @@ def parse_config_file(filepath: str):
                     if user_id_str.isdigit() and description: CHAR_DESCRIPTIONS[user_id_str] = description
                     else: logger.warning(f"Skipping invalid line in CHARS section: {char_line}")
         if not BASE_SYSTEM_PROMPT: logger.error(f"CRITICAL: '!!SYSTEM_PROMPT' not found or empty in {filepath}.")
-        # TOOLS_PROMPT теперь часть BASE_SYSTEM_PROMPT, отдельная проверка не так критична, но оставим
-        if not TOOLS_PROMPT: logger.warning(f"'!!TOOLS' section not found or empty in {filepath}. Calendar fetching via !fetchcalc might not work as expected if not in SYSTEM_PROMPT.")
+        if not TOOLS_PROMPT: logger.warning(f"'!!TOOLS' section not found or empty in {filepath}.")
         logger.info(f"Config loaded from {filepath}:"); logger.info(f"  SYSTEM_PROMPT: {'Loaded' if BASE_SYSTEM_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  MY_CHARACTER_DESCRIPTION: {'Loaded' if MY_CHARACTER_DESCRIPTION else 'MISSING/EMPTY'}"); logger.info(f"  TOOLS_PROMPT: {'Loaded' if TOOLS_PROMPT else 'MISSING/EMPTY'}"); logger.info(f"  Loaded {len(CHAR_DESCRIPTIONS)} character descriptions."); logger.debug(f"PARSED CHAR_DESCRIPTIONS: {CHAR_DESCRIPTIONS}")
     except FileNotFoundError: logger.critical(f"CRITICAL: Configuration file '{filepath}' not found."); exit()
     except Exception as e: logger.critical(f"CRITICAL: Error parsing config file '{filepath}': {e}", exc_info=True); exit()
+
 
 # --- Функции работы с БД истории (без изменений) ---
 # ... (код init_history_db, update_chat_history, get_formatted_history) ...
@@ -117,12 +173,11 @@ def get_formatted_history(chat_id: int) -> list:
         return gemini_history
     except psycopg.Error as e: logger.error(f"Failed to retrieve history from DB for chat {chat_id}: {e}"); return []
 
-# --- ИЗМЕНЕННАЯ Функция для обогащения текста сообщения (добавляем маркер) ---
-def enrich_message_for_history(message: Message) -> str:
-    meta_parts = [] 
-    text_parts = []   
 
-    # ... (вся логика формирования meta_parts и text_parts остается прежней) ...
+# --- Функция enrich_message_for_history (без изменений, мы ее уже обновили) ---
+# ... (код enrich_message_for_history) ...
+def enrich_message_for_history(message: Message) -> str:
+    meta_parts = [] ; text_parts = []   
     if message.reply_to_message:
         reply_to = message.reply_to_message; reply_sender_display_name = "собеседнику"
         if reply_to.from_user: reply_sender_display_name = reply_to.from_user.first_name or reply_to.from_user.full_name or f"User_{reply_to.from_user.id}"
@@ -151,61 +206,25 @@ def enrich_message_for_history(message: Message) -> str:
         if media_details_str: meta_parts.append(f"meta_media_details: {media_details_str.replace(':',';').replace(' ', '_')[:50]}")
     if message.caption: meta_parts.append(f"meta_caption: true"); text_parts.append(message.caption.strip())
     elif message.text: text_parts.append(message.text.strip())
-    
     final_parts_for_history = []
     if meta_parts: final_parts_for_history.append(" ".join(meta_parts))
     if text_parts: final_parts_for_history.append(" ".join(text_parts))
-    
-    # --- ДОБАВЛЯЕМ МАРКЕР КОНЦА МЕТА-КОНТЕКСТА ---
-    enriched_text = " ".join(final_parts_for_history).strip()
-    if not enriched_text: # Если вообще ничего не было
-        if media_type_str: return f"meta_content_type: {media_type_str} (без_текста_или_подписи) {META_CONTEXT_END_MARKER}"
-        enriched_text = f"meta_info: [пустое_или_нераспознанное_сообщение]"
-        
-    return f"{enriched_text} {META_CONTEXT_END_MARKER}"
+    result_text = " ".join(final_parts_for_history).strip()
+    if not result_text:
+        if media_type_str: return f"meta_content_type: {media_type_str} (без_текста_или_подписи)"
+        return "meta_info: [пустое_или_нераспознанное_сообщение]"
+    return result_text
 
-# --- Функция для вызова Gemini API (передаем системный промпт в конце) ---
-async def generate_gemini_response(contents_without_system_prompt: list, system_prompt_to_use: str) -> str | None:
-    global gemini_model
+# --- Функция для вызова Gemini API (без изменений) ---
+# ... (код generate_gemini_response) ...
+async def generate_gemini_response(contents: list) -> str | None:
+    global gemini_model;
     if not gemini_model: logger.error("Gemini model not initialized!"); return None
-    
-    # Собираем финальный контент: сначала история и контекст, потом системный промпт
-    final_contents = list(contents_without_system_prompt) # Копируем, чтобы не изменить оригинал
-    if system_prompt_to_use:
-        # Gemini API (через библиотеку) обычно ожидает system_instruction при инициализации модели,
-        # или можно передать его как первую часть контента с особой ролью, если API поддерживает.
-        # Если мы хотим его в конце, то он должен быть как обычное сообщение от "user" или "model",
-        # инструктирующее модель. Для Gemini лучше, если системная инструкция идет ПЕРВОЙ
-        # или задана при инициализации. Перенос в конец может работать хуже.
-        # НО, ты просил в конец. Попробуем добавить его как последнее сообщение от "user".
-        # Это не стандартно для роли "system", но может сработать как финальная инструкция.
-        final_contents.append({"role": "user", "parts": [{"text": f"Важное указание по генерации ответа (следовать неукоснительно):\n{system_prompt_to_use}"}]})
-        # ИЛИ, если модель была инициализирована БЕЗ system_instruction, то так:
-        # final_contents.insert(0, {"role": "system", "parts": [{"text": system_prompt_to_use}]})
-
-    if not final_contents: logger.warning("Cannot generate response for empty final_contents list."); return None
-
-    logger.info(f"Sending request to Gemini with {len(final_contents)} content entries (system prompt at end).")
-    # logger.debug(f"Full Gemini Payload (contents): {json.dumps(final_contents, ensure_ascii=False, indent=2)}")
-
+    if not contents: logger.warning("Cannot generate response for empty contents list."); return None
+    logger.info(f"Sending request to Gemini with {len(contents)} content entries.")
     try:
-        # Модель инициализирована БЕЗ system_instruction, если мы передаем его в contents
-        # Если модель инициализирована С system_instruction, то передача его здесь может конфликтовать.
-        # Для текущей задачи, где BASE_SYSTEM_PROMPT задан при инициализации,
-        # добавление его еще раз в конец не очень хорошая идея.
-        # Оставим модель с BASE_SYSTEM_PROMPT, а в `process_chat_after_delay` будем формировать
-        # начальный контекст и историю, а системный промпт уже применен.
-        # ----
-        # Откат к предыдущей версии: системный промпт задается при инициализации модели.
-        # generate_gemini_response просто принимает `contents` (контекст + история)
-        
-        response = await gemini_model.generate_content_async(
-            contents=contents_without_system_prompt, # <--- Используем контент БЕЗ системного промпта здесь
-                                                      # так как он уже в модели
-            generation_config=genai.types.GenerationConfig(temperature=0.7),
-            safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-                             'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'}
-        )
+        response = await gemini_model.generate_content_async(contents=contents, generation_config=genai.types.GenerationConfig(temperature=0.7),
+            safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HARM_CATEGORY_HATE_SPEECH': 'block_none', 'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'})
         if response and response.parts:
             generated_text = "".join(part.text for part in response.parts).strip()
             if generated_text and "cannot fulfill" not in generated_text.lower() and "unable to process" not in generated_text.lower():
@@ -216,106 +235,70 @@ async def generate_gemini_response(contents_without_system_prompt: list, system_
         return None
     except Exception as e: logger.error(f"Error calling Gemini API: {type(e).__name__}: {e}", exc_info=True); return None
 
-
 # --- ИЗМЕНЕННАЯ Функция обработки чата ПОСЛЕ задержки ---
 async def process_chat_after_delay(
-    chat_id: int, sender_name: str, sender_id_str: str,
-    business_connection_id: str | None, context: ContextTypes.DEFAULT_TYPE
+    chat_id: int,
+    sender_name: str,
+    sender_id_str: str,
+    business_connection_id: str | None,
+    context: ContextTypes.DEFAULT_TYPE
 ):
     logger.info(f"Debounce timer expired for chat {chat_id} with sender {sender_id_str}. Processing...")
-    current_history = get_formatted_history(chat_id) # Уже содержит META_CONTEXT_END_MARKER
+    current_history = get_formatted_history(chat_id)
     saratov_time_str = get_saratov_datetime_info()
 
-    # --- Формируем ПЕРВЫЙ ЗАПРОС: Контекст + История. Системный промпт (с TOOLS) уже в модели. ---
-    contents_for_gemini = []
-    # 1. Блок контекстной информации (описания, время)
+    initial_contents = []
     context_block_text = ""
     if MY_CHARACTER_DESCRIPTION: context_block_text += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
     interlocutor_description = CHAR_DESCRIPTIONS.get(sender_id_str)
     if interlocutor_description: context_block_text += f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
     context_block_text += f"Текущее время в Саратове (где находится Киткат): {saratov_time_str}\n\n"
-    # TOOLS_PROMPT теперь часть BASE_SYSTEM_PROMPT, который уже в модели.
-
-    if context_block_text.strip():
-        # Добавляем этот блок как первое сообщение от "model" перед историей
-        contents_for_gemini.append({"role": "model", "parts": [{"text": context_block_text.strip() + f" {META_CONTEXT_END_MARKER}"}]}) # Тоже с маркером
-    
-    # 2. Добавляем историю (каждый элемент уже имеет маркер)
-    contents_for_gemini.extend(current_history)
+    if TOOLS_PROMPT: context_block_text += f"Инструкции по инструментам:\n{TOOLS_PROMPT}\n\n"
+    if context_block_text.strip(): initial_contents.append({"role": "model", "parts": [{"text": context_block_text.strip()}]})
+    initial_contents.extend(current_history)
 
     logger.debug("Attempting initial Gemini call...")
-    gemini_response_from_api = await generate_gemini_response(contents_for_gemini)
+    gemini_response_from_api = await generate_gemini_response(initial_contents) # Ответ от API
 
-    # --- "Кастрация" ответа: ищем маркер и берем текст после него ---
-    final_gemini_response = None
-    if gemini_response_from_api:
-        parts = gemini_response_from_api.split(META_CONTEXT_END_MARKER)
-        if len(parts) > 1: # Если маркер найден
-            final_gemini_response = parts[-1].strip() # Берем последнюю часть
-            logger.info(f"Sanitized response (marker found): '{final_gemini_response[:50]}...'")
-            if not final_gemini_response and gemini_response_from_api.strip() != META_CONTEXT_END_MARKER.strip(): # Если после маркера пусто, а до него что-то было
-                logger.warning(f"Response was cut to empty after '{META_CONTEXT_END_MARKER}'. Original: '{gemini_response_from_api[:100]}...' Taking original.")
-                final_gemini_response = gemini_response_from_api # Взять оригинал, если после маркера пусто
-        else: # Маркер не найден, используем ответ как есть
-            final_gemini_response = gemini_response_from_api.strip()
-            logger.info(f"Sanitized response (no marker): '{final_gemini_response[:50]}...'")
-    
-    gemini_response_raw = final_gemini_response # Это теперь наш "чистый" ответ
+    # --- ОЧИСТКА ответа перед дальнейшей обработкой ---
+    gemini_response_raw = sanitize_gemini_response(gemini_response_from_api) if gemini_response_from_api else None
+    if gemini_response_from_api and not gemini_response_raw:
+        logger.warning(f"Sanitizer possibly removed the entire Gemini response. Original: '{gemini_response_from_api[:100]}'")
+
 
     if gemini_response_raw == "!fetchcalc":
+        # ... (логика для !fetchcalc) ...
         logger.info(f"Received '!fetchcalc' signal for chat {chat_id}. Fetching calendar info...")
         calendar_content = "Информация из календаря недоступна."
         try:
             with open(CALENDAR_FILE, 'r', encoding='utf-8') as f: calendar_content = f.read().strip()
             if not calendar_content: logger.warning(f"Calendar file '{CALENDAR_FILE}' is empty."); calendar_content = "Файл календаря пуст."
+            else: logger.info(f"Successfully read calendar file '{CALENDAR_FILE}'.")
         except FileNotFoundError: logger.error(f"Calendar file '{CALENDAR_FILE}' not found!")
         except Exception as e: logger.error(f"Error reading calendar file '{CALENDAR_FILE}': {e}")
-
-        # --- Формируем ВТОРОЙ ЗАПРОС с календарем. Системный промпт (без TOOLS) ---
-        # Создаем новый системный промпт БЕЗ секции TOOLS для этого запроса
-        system_prompt_for_calendar = BASE_SYSTEM_PROMPT.replace(TOOLS_PROMPT, "").strip() if TOOLS_PROMPT else BASE_SYSTEM_PROMPT
-
-        contents_for_calendar_gemini = []
-        context_block_text_calendar = ""
-        if MY_CHARACTER_DESCRIPTION: context_block_text_calendar += f"Немного информации обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
-        if interlocutor_description: context_block_text_calendar += f"Информация о текущем собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
-        context_block_text_calendar += f"Текущее время в Саратове: {saratov_time_str}\n\n"
-        
-        calendar_intro_text = (
-            f"Для ответа на вопрос пользователя требуется информация из его расписания.\n"
-            f"Вот предоставленное пользователем расписание:\n------\n{calendar_content}\n------\n"
-            f"Пожалуйста, проанализируй это расписание и текущее время, и ответь на последний вопрос пользователя."
-        )
-        # Добавляем системный промпт (без TOOLS) в начало
-        # или передаем в `system_instruction` если бы мы не инициализировали модель с ним
-        if system_prompt_for_calendar:
-             contents_for_calendar_gemini.append({"role": "user", "parts": [{"text": f"Новая инструкция (следовать ей):\n{system_prompt_for_calendar}"}]})
+        calendar_prompt_contents = []; calendar_intro = (f"Для ответа на предыдущий вопрос пользователя требуется информация из его расписания.\n"
+                          f"Текущая дата и время в Саратове (где находится пользователь Киткат): {saratov_time_str}\n"
+                          f"Вот предоставленное пользователем расписание (содержимое файла {CALENDAR_FILE}):\n------\n{calendar_content}\n------\n"
+                          f"Пожалуйста, проанализируй это расписание и текущее время, и ответь на последний вопрос пользователя, следуя основной инструкции и стилю Китката.")
+        context_block_text_for_calendar = ""
+        if MY_CHARACTER_DESCRIPTION: context_block_text_for_calendar += f"Напомню информацию обо мне ({MY_NAME_FOR_HISTORY}):\n{MY_CHARACTER_DESCRIPTION}\n\n"
+        if interlocutor_description: context_block_text_for_calendar += f"Напомню информацию о собеседнике ({sender_name}, ID: {sender_id_str}):\n{interlocutor_description}\n\n"
+        context_block_text_for_calendar += f"Текущее время в Саратове: {saratov_time_str}\n\n"
+        if context_block_text_for_calendar.strip(): calendar_prompt_contents.append({"role": "model", "parts": [{"text": context_block_text_for_calendar.strip()}]})
+        calendar_prompt_contents.append({"role": "user", "parts": [{"text": calendar_intro}]}); calendar_prompt_contents.extend(current_history)
+        logger.debug("Attempting second Gemini call with calendar info...")
+        gemini_response_from_api_calendar = await generate_gemini_response(calendar_prompt_contents)
+        # --- ОЧИСТКА второго ответа ---
+        gemini_response_raw = sanitize_gemini_response(gemini_response_from_api_calendar) if gemini_response_from_api_calendar else None
+        if gemini_response_from_api_calendar and not gemini_response_raw:
+             logger.warning(f"Sanitizer possibly removed the entire Gemini response (calendar). Original: '{gemini_response_from_api_calendar[:100]}'")
+        if not gemini_response_raw: logger.error(f"Second Gemini call (with calendar) failed or was sanitized to empty for chat {chat_id}.")
 
 
-        if context_block_text_calendar.strip():
-            contents_for_calendar_gemini.append({"role": "model", "parts": [{"text": context_block_text_calendar.strip() + f" {META_CONTEXT_END_MARKER}"}]})
-        contents_for_calendar_gemini.append({"role": "user", "parts": [{"text": calendar_intro_text + f" {META_CONTEXT_END_MARKER}"}]})
-        contents_for_calendar_gemini.extend(current_history) # История уже с маркерами
-
-        logger.debug("Attempting second Gemini call with calendar info (and modified system prompt)...")
-        gemini_response_from_api_calendar = await generate_gemini_response(contents_for_calendar_gemini) # Используем тот же generate_gemini_response
-        
-        # "Кастрация" второго ответа
-        if gemini_response_from_api_calendar:
-            parts_cal = gemini_response_from_api_calendar.split(META_CONTEXT_END_MARKER)
-            if len(parts_cal) > 1: gemini_response_raw = parts_cal[-1].strip()
-            else: gemini_response_raw = gemini_response_from_api_calendar.strip()
-            if not gemini_response_raw and gemini_response_from_api_calendar.strip() != META_CONTEXT_END_MARKER.strip():
-                gemini_response_raw = gemini_response_from_api_calendar # Взять оригинал
-        else: gemini_response_raw = None
-
-        if not gemini_response_raw: logger.error(f"Second Gemini call (calendar) failed or sanitized to empty for chat {chat_id}.")
-
-    # --- Обработка финального (очищенного) ответа ---
     if gemini_response_raw and gemini_response_raw != "!fetchcalc":
         reply_uuid = str(uuid.uuid4())
-        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id)
-        logger.debug(f"Stored final SANITIZED pending reply with UUID {reply_uuid}: '{gemini_response_raw[:50]}...'")
+        pending_replies[reply_uuid] = (gemini_response_raw, business_connection_id, chat_id) # Сохраняем УЖЕ ОЧИЩЕННЫЙ
+        logger.debug(f"Stored final SANITIZED pending reply with UUID {reply_uuid}")
         preview_text = gemini_response_raw.replace("!NEWMSG!", "\n\n🔚\n\n")
         # ... (отправка превью как было) ...
         try:
@@ -329,9 +312,9 @@ async def process_chat_after_delay(
             logger.info(f"Sent suggestion preview (UUID: {reply_uuid}) for target_chat {chat_id} to {MY_TELEGRAM_ID}")
         except TelegramError as e: logger.error(f"Failed to send suggestion preview (HTML) to MY_TELEGRAM_ID {MY_TELEGRAM_ID}: {e}", exc_info=True);
     elif gemini_response_raw == "!fetchcalc":
-        logger.error(f"Gemini returned '!fetchcalc' even after providing calendar data (or sanitized to it) for chat {chat_id}.")
+        logger.error(f"Gemini returned '!fetchcalc' even after providing calendar data for chat {chat_id} (or it was sanitized to it).")
     else:
-        logger.warning(f"No valid response generated or response was sanitized to empty by Gemini for chat {chat_id} after debounce (final).")
+        logger.warning(f"No response generated or response was sanitized to empty by Gemini for chat {chat_id} after debounce (final).")
 
     if chat_id in debounce_tasks: del debounce_tasks[chat_id]; logger.debug(f"Removed completed debounce task for chat {chat_id}")
 
@@ -341,7 +324,7 @@ async def process_chat_after_delay(
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_to_process = update.business_message or update.edited_business_message
     if not message_to_process: return
-    enriched_history_text = enrich_message_for_history(message_to_process) # <--- Получаем обогащенный текст С МАРКЕРОМ
+    enriched_history_text = enrich_message_for_history(message_to_process)
     logger.debug(f"Chat {message_to_process.chat.id} | Enriched: '{enriched_history_text[:100]}...'")
     chat = message_to_process.chat; sender = message_to_process.from_user
     business_connection_id = getattr(message_to_process, 'business_connection_id', None)
@@ -351,7 +334,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     if sender and sender.id == MY_TELEGRAM_ID and original_text_from_update.startswith("/v "):
         transcription = original_text_from_update[3:].strip()
         if transcription:
-            final_voice_text_for_history = f"meta_content_type: voice_message (расшифровано_пользователем: {MY_NAME_FOR_HISTORY}) {transcription} {META_CONTEXT_END_MARKER}" # Добавляем маркер
+            final_voice_text_for_history = f"meta_content_type: voice_message (расшифровано_пользователем: {MY_NAME_FOR_HISTORY}) {transcription}"
             logger.info(f"Processing /v command in chat {chat_id}. History text: '{final_voice_text_for_history[:50]}...'")
             update_chat_history(chat_id, "user", final_voice_text_for_history)
             logger.info(f"Message with /v command in chat {chat_id} was not deleted (deletion disabled).")
@@ -374,7 +357,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
     if is_outgoing:
         logger.info(f"Processing OUTGOING business message in chat {chat_id} from {sender_id_str}")
         logger.debug(f"Outgoing message details: text='{message_to_process.text}', caption='{message_to_process.caption}', photo_present={message_to_process.photo is not None}, video_present={message_to_process.video is not None}")
-        update_chat_history(chat_id, "model", enriched_history_text) # Используем обогащенный текст С МАРКЕРОМ
+        update_chat_history(chat_id, "model", enriched_history_text)
         if chat_id in debounce_tasks:
              logger.debug(f"Cancelling debounce task for chat {chat_id} due to outgoing message.")
              try: debounce_tasks[chat_id].cancel()
@@ -383,7 +366,7 @@ async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_T
         return
     if not sender: logger.warning(f"Incoming message in chat {chat_id} without sender info. Skipping."); return
     logger.info(f"Processing INCOMING business message from user {sender_id_str} in chat {chat_id} via ConnID: {business_connection_id}")
-    update_chat_history(chat_id, "user", enriched_history_text) # Используем обогащенный текст С МАРКЕРОМ
+    update_chat_history(chat_id, "user", enriched_history_text)
     if chat_id in debounce_tasks:
         logger.debug(f"Cancelling previous debounce task for chat {chat_id}")
         try: debounce_tasks[chat_id].cancel()
@@ -414,9 +397,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Button press: Attempting to process reply with UUID: {reply_uuid}")
         pending_data = pending_replies.pop(reply_uuid, None)
         if not pending_data: logger.warning(f"No pending reply found for UUID {reply_uuid}."); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Ответ не найден.", parse_mode=ParseMode.HTML, reply_markup=None); return
-        response_text_raw, final_business_connection_id, target_chat_id_for_send = pending_data # Этот response_text_raw уже очищен
+        response_text_raw, final_business_connection_id, target_chat_id_for_send = pending_data
         if not response_text_raw: logger.error(f"Stored raw response_text is None for UUID {reply_uuid}!"); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Пустой текст.", parse_mode=ParseMode.HTML, reply_markup=None); return
-        logger.debug(f"Found (already sanitized) pending reply for UUID {reply_uuid} (target chat {target_chat_id_for_send}): '{response_text_raw[:50]}...' using ConnID: {final_business_connection_id}")
+        logger.debug(f"Found RAW pending reply for UUID {reply_uuid} (target chat {target_chat_id_for_send}): '{response_text_raw[:50]}...' using ConnID: {final_business_connection_id}")
         message_parts = [part.strip() for part in response_text_raw.split("!NEWMSG!") if part.strip()]
         total_parts = len(message_parts); sent_count = 0; first_error = None
         if not message_parts: logger.warning(f"Raw response for UUID {reply_uuid} resulted in no parts!"); await query.edit_message_text(text=query.message.text_html + "\n\n<b>⚠️ Ошибка:</b> Пустой ответ.", parse_mode=ParseMode.HTML, reply_markup=None); return
@@ -439,7 +422,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError) as e: logger.error(f"Error parsing callback_data '{data}' or processing reply for UUID {reply_uuid}: {e}");
     except Exception as e: logger.error(f"Unexpected error in button_handler (UUID {reply_uuid}): {e}", exc_info=True);
 
-# ... (код post_init и __main__) ...
+# ... (код post_init) ...
 async def post_init(application: Application):
     webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
     logger.info(f"Attempting to set webhook using: {webhook_full_url}")
@@ -453,17 +436,15 @@ async def post_init(application: Application):
         if webhook_info.url == webhook_full_url: logger.info("Webhook successfully set!")
         else: logger.warning(f"Webhook URL reported differ: {webhook_info.url}")
     except Exception as e: logger.error(f"Error setting webhook: {e}", exc_info=True)
+
+# ... (код __main__) ...
 if __name__ == "__main__":
     logger.info("Initializing Telegram Business Bot with Gemini...")
     parse_config_file(CONFIG_FILE); init_history_db()
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # ВАЖНО: Модель инициализируется с BASE_SYSTEM_PROMPT.
-        # Этот BASE_SYSTEM_PROMPT (из adp.txt) должен содержать основную инструкцию
-        # и, если нужно, TOOLS_PROMPT для первого запроса.
-        # Для второго запроса (с календарем) мы будем формировать новый system_prompt "на лету".
         gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=BASE_SYSTEM_PROMPT)
-        logger.info(f"Gemini model '{gemini_model.model_name}' initialized successfully WITH system_instruction.")
+        logger.info(f"Gemini model '{gemini_model.model_name}' initialized successfully.")
     except Exception as e: logger.critical(f"CRITICAL: Failed to initialize Gemini: {e}", exc_info=True); exit()
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
