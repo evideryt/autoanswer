@@ -51,9 +51,9 @@ else:
 
 # --- Остальные глобальные переменные ---
 MAX_HISTORY_PER_CHAT = 700
-DEBOUNCE_DELAY = 15
+DEBOUNCE_DELAY = 1
 MY_NAME_FOR_HISTORY = "киткат"
-MESSAGE_SPLIT_DELAY = 0.7
+MESSAGE_SPLIT_DELAY = 2
 GEMINI_MODEL_NAME = "gemini-2.0-flash"
 
 BASE_SYSTEM_PROMPT = ""
